@@ -1,9 +1,9 @@
-# The two shared buses
+# The shared buses
 
 Addons that use nui each compile their own copy of it, which means several copies of the library
 can be alive in one game process at once, at different versions, loading and unloading in any
-order. Two things cannot be done per copy: patching the client, and holding a texture. Those go
-through named shared memory, and their layouts are frozen.
+order. Three things cannot be done per copy: patching the client's renderer, holding a texture, and
+patching the controller read. Those go through named shared memory, and their layouts are frozen.
 
 Frozen means the offsets never move. New fields are only ever appended into reserved space with a
 revision number, and zero always means "the old behaviour", because the mapping starts zeroed. A
@@ -72,3 +72,38 @@ the pixels without bumping the version.
 
 On a scene with 25 distinct textures, a second addon sharing them adds nothing measurable, against
 roughly 12 MiB when it holds its own.
+
+## PadHook 1
+
+`Local\FFXiPadHook_v1_<pid>`, 4,096 bytes, mapped whole. Added in nui 1.3.0
+(`src/PadHook/PadHook.h`, frozen as `test/frozen/layout_padhook.1.3.0.txt`).
+
+With the client's **Enable XInput** setting on, the game reads the pad with
+`xinput1_3.dll!XInputGetState` every frame. There can only be one patch of that function, so, as with
+UiHook, there is one bus, its ABI is 1 forever, and everything after is a revision within it.
+
+- **The patch is the Windows hot-patch form.** A long jump goes into the five bytes of padding before
+  the function, where no thread runs, and then the function's first two bytes (`8B FF`,
+  `mov edi, edi`) become a short jump back to it, in one locked 16-bit write. Calling the function's
+  third byte is the original, so nothing is displaced. Anything else at the entry (another tool's hook,
+  code that is not hot-patchable) is never patched over: `pad_start()` fails without a retry and says
+  what bytes it found.
+- **nui never loads `xinput1_3.dll`.** While it is not loaded (the game reads a DirectInput pad, or has
+  not read one yet), `pad_start()` asks to be retried. Once found, it is pinned, so it can never unload
+  under the patch.
+- **The thunk is a pass-through when nobody drives.** As UiHook: the newest revision drives, a module
+  hands the dispatch on in `DllMain`, and a register replaces a driver whose module has gone.
+- **What the dispatcher does.** It calls the original, records the state per user index behind a
+  seqlock (for every module to read), and applies one shared mask:
+  - while any live client **holds the pad**, presses made from then on are hidden from the game, and
+    the sticks read centred and the triggers released;
+  - a button the game had already seen go down stays the game's until it is released;
+  - a press the game never saw stays hidden until it is released, even after the pad is given back,
+    so the game never sees half a press;
+  - `dwPacketNumber` is renumbered, so it changes exactly when what the game sees changes.
+- **A hold needs a heartbeat.** A client that has not renewed its hold for 250 ms (`pad()` renews it)
+  no longer holds the pad. An addon that errors or stops polling can never leave the player without a
+  controller.
+- **Designed for a second source.** `PadState::source` says where a state came from (`xinput`, and
+  `dinput` reserved), and the mask works on one button word in XInput's layout with the triggers as
+  two more bits. A DirectInput hook in a later revision adds a source, not a new contract.

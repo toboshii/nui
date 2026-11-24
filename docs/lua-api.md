@@ -105,6 +105,57 @@ A fallback scanner for a future client where the config table has moved: ask the
 they are using, call `wtfind` with it, and `wtread` uses what it learns. Most addons never need
 these.
 
+## The controller (1.3.0)
+
+nui can read the pad the game reads, and keep presses from the game while the addon uses them. It
+hooks `XInputGetState` once per process, shared by every nui module (PadHook 1, see
+[abi.md](abi.md)). Only XInput is read in this version: with the client's **Enable XInput** setting off,
+the game uses DirectInput and `pad_start()` keeps asking to be retried.
+
+### `pad_start([flags]) -> ok, msg [, retry_ms]`
+
+Join the pad hook, patching `XInputGetState` if no module has. As `start()`: `retry_ms` means try again
+later (`xinput1_3.dll` is not loaded yet); no `retry_ms` means never in this process (the function is
+already hooked by another tool, or is not hot-patchable), and `msg` says so. `flags` may contain
+`nosig`, which always takes the not-loaded path (the fail-closed test).
+
+### `pad() -> seq, buttons, lt, rt, lx, ly, rx, ry, index, holding`
+
+What the game last read, raw (before any mask), from the user index that last read a connected pad.
+Returns numbers, not a table, so polling it every frame allocates nothing.
+
+| Value | What |
+|---|---|
+| `seq` | changes with every change of the rest; 0 = nothing read yet; -1 = the read was torn (try next frame) |
+| `buttons` | `XINPUT_GAMEPAD_*` bits; `0x10000` LT held, `0x20000` RT held |
+| `lt`, `rt` | 0 to 255 |
+| `lx`, `ly`, `rx`, `ry` | -32768 to 32767 |
+| `index` | the XInput user index, -1 when not connected |
+| `holding` | this module holds the pad |
+
+Each call is also the hold's heartbeat: poll it from `prerender`.
+
+### `pad_capture(on)`
+
+Hold the pad (`true`) or give it back. While held, new presses, the sticks and the triggers are hidden
+from the game; see [abi.md](abi.md) for the exact rules on buttons held across the change. A hold
+lapses by itself 250 ms after the last `pad()`.
+
+### `pad_config() -> {key, padmode, padsin}` or `nil, why`
+
+The game's own pad settings, read from the registry, as the client's config tool writes them:
+`padmode` is six comma-separated flags (the sixth is Enable XInput), `padsin` is 27 button ids, one per
+game action (5 Cancel, 6 Main menu, 7 Confirm, 8 Active window, ...).
+
+### `pad_status() -> table`
+
+`state` (`live`, `waiting`, `blocked`, `no bus`), `describe` (one line), `joined`, `holding`, `calls`,
+`clients`, `masked`, `hidden`, `lapses`, `reads`, `source`, `site`, `rev`, `owner_rev`.
+
+### `pad_stop()`
+
+Give the pad back and leave the hook. `stop()` and unloading do this too.
+
 ## Diagnostics
 
 ### `status() -> table`
