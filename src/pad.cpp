@@ -118,6 +118,14 @@ int __cdecl l_pad_capture(lua_State* L) {
     return 1;
 }
 
+int __cdecl l_pad_chord(lua_State* L) {
+    double const v = L_.gettop(L) >= 1 && L_.type(L, 1) == kTNumber ? L_.tonumber(L, 1) : 0;
+    if (!g_pbus || g_pslot < 0) { L_.pushboolean(L, 0); return 1; }
+    padhook_chord(g_pbus, g_pslot, v > 0 ? static_cast<unsigned long>(v) & 0x3FFFFul : 0);
+    L_.pushboolean(L, 1);
+    return 1;
+}
+
 int __cdecl l_pad_config(lua_State* L) {
     static char const* const keys[] = {"SOFTWARE\\PlayOnlineUS\\SquareEnix\\FinalFantasyXI",
                                        "SOFTWARE\\PlayOnlineEU\\SquareEnix\\FinalFantasyXI",
@@ -155,6 +163,7 @@ int __cdecl l_pad_status(lua_State* L) {
     set_num(L, "installs", b->installs);
     set_num(L, "handovers", b->handovers);
     set_num(L, "lapses", b->lapses);
+    set_num(L, "chord", b->chord.buttons);
     set_num(L, "clients", padhook_active_clients(b));
     set_num(L, "owner_rev", b->owner_rev);
     set_num(L, "rev", PADHOOK_REV);

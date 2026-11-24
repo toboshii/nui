@@ -156,28 +156,58 @@ int run_main(char const* layout_path) {
     padhook_capture(bus, slot, false);
     press(0);
 
-    // a second module at revision 2 takes the dispatch; its DllMain hands it back
-    HMODULE m2 = LoadLibraryA("pad_mod_r2.dll");
-    check("module r2 loads", m2 != nullptr);
+    // the chord (rev 2): L3 + R3 never reaches the game; L3 alone does, late or replayed
+    {
+        constexpr unsigned L3 = 0x40, R3 = 0x80;
+        padhook_chord(bus, slot, L3 | R3);
+        press(0);
+        check("chord: on the bus", bus->chord.buttons == (L3 | R3));
+        s = press(L3);
+        check("chord: L3 held back", (s.buttons & L3) == 0);
+        s = press(L3 | R3);
+        check("chord: never seen", (s.buttons & (L3 | R3)) == 0);
+        s = press(R3);
+        check("chord: hidden until released", (s.buttons & R3) == 0);
+        press(0);
+        press(L3);
+        s = press(0);
+        check("chord: a tap alone is replayed", (s.buttons & L3) != 0);
+        press(0);
+        press(0);
+        s = press(L3);
+        for (int i = 0; i < 20 && !(s.buttons & L3); ++i) { Sleep(20); s = read(); }
+        check("chord: held alone, the game gets it", (s.buttons & L3) != 0);
+        s = press(L3 | R3);
+        check("chord: after that, R3 is the game's too", (s.buttons & (L3 | R3)) == (L3 | R3));
+        press(0);
+        padhook_chord(bus, slot, 0);
+        s = press(L3);
+        check("chord: off, L3 at once", (s.buttons & L3) != 0);
+        press(0);
+    }
+
+    // a second module at revision 3 takes the dispatch; its DllMain hands it back
+    HMODULE m2 = LoadLibraryA("pad_mod_r3.dll");
+    check("module r3 loads", m2 != nullptr);
     if (m2) {
         auto mjoin = reinterpret_cast<join_fn>(reinterpret_cast<void*>(GetProcAddress(m2, "mod_join")));
         auto mcap = reinterpret_cast<cap_fn>(reinterpret_cast<void*>(GetProcAddress(m2, "mod_capture")));
         auto mdis = reinterpret_cast<ptr_fn>(reinterpret_cast<void*>(GetProcAddress(m2, "mod_dispatch")));
         int const s2 = mjoin ? mjoin() : -1;
-        check("r2 joins", s2 >= 0 && s2 != slot);
-        check("r2 drives", bus->owner_slot == s2 && reinterpret_cast<void*>(*bus->dispatch_ptr) == mdis());
+        check("r3 joins", s2 >= 0 && s2 != slot);
+        check("r3 drives", bus->owner_slot == s2 && reinterpret_cast<void*>(*bus->dispatch_ptr) == mdis());
         check("no second install", bus->installs == 1);
         s = press(A);
-        check("r2 dispatches", s.buttons == A);
+        check("r3 dispatches", s.buttons == A);
         mcap(1);
         s = press(A | B);
-        check("r2's capture hides for everyone", (s.buttons & B) == 0 && (s.buttons & A) != 0);
+        check("r3's capture hides for everyone", (s.buttons & B) == 0 && (s.buttons & A) != 0);
         press(0);
         FreeLibrary(m2);
-        check("r2 left: the dispatch is back with A", bus->owner_slot == slot && *bus->dispatch_ptr == &padhook_detail::dispatch);
+        check("r3 left: the dispatch is back with A", bus->owner_slot == slot && *bus->dispatch_ptr == &padhook_detail::dispatch);
         s = press(A);
-        check("after r2 unloaded: reads still work", s.buttons == A, "");
-        check("r2's capture went with it", s.buttons == A);
+        check("after r3 unloaded: reads still work", s.buttons == A, "");
+        check("r3's capture went with it", s.buttons == A);
         press(0);
     }
 

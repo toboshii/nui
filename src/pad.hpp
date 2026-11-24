@@ -11,6 +11,9 @@
 //        0x10000 / 0x20000 for LT / RT held. Each call is also the capture's heartbeat. nil when not started.
 //   pad_capture(on)                              hold the pad (the game stops seeing new presses, the
 //        sticks and the triggers) or give it back. A capture lapses by itself 250 ms after the last pad().
+//   pad_chord(buttons)                           (1.4.0) the buttons that take the pad together (e.g. L3 + R3:
+//        0xC0); the hook keeps that chord from the game, even where the game maps those buttons itself.
+//        A chord button pressed alone reaches the game up to 150 ms late; tapped alone, it still does.
 //   pad_config() -> {key, padmode, padsin} | nil, why   the game's own pad settings (registry, read only)
 //   pad_status() -> table                        state, describe, calls, clients, holding, masked, hidden, lapses, ...
 //   pad_stop()                                   leave the hook (also done by stop() and in DllMain)
@@ -26,6 +29,7 @@ void pad_release();                       // stop(): give the pad back and leave
 int __cdecl l_pad_start(lua_State* L);
 int __cdecl l_pad(lua_State* L);
 int __cdecl l_pad_capture(lua_State* L);
+int __cdecl l_pad_chord(lua_State* L);
 int __cdecl l_pad_config(lua_State* L);
 int __cdecl l_pad_status(lua_State* L);
 int __cdecl l_pad_stop(lua_State* L);

@@ -34,13 +34,17 @@ inline int padhook_layout_text(char* out, int cap) {
 #undef M
     line("sizeof(PadClient)", UL(sizeof(PadClient)));
 #define C(f) line("PadClient." #f, UL(offsetof(PadClient, f)))
-    C(occupied); C(capture); C(alive_tick); C(dispatch); C(rev); C(module); C(nonce_at); C(nonce); C(name); C(reserved);
+    C(occupied); C(capture); C(alive_tick); C(dispatch); C(rev); C(module); C(nonce_at); C(nonce); C(name); C(chord); C(reserved);
 #undef C
 #define B(f) line("PadBus." #f, UL(offsetof(PadBus, f)))
     B(ready); B(abi_version); B(size); B(install_lock); B(hook_installed); B(owner_slot); B(in_flight); B(installs);
     B(calls); B(block); B(dispatch_ptr); B(site); B(original); B(owner_rev); B(reg_lock); B(handovers); B(blocked);
-    B(serial); B(write_lock); B(wseq); B(last_index); B(lapses); B(reserved_hdr); B(pads); B(masks); B(clients); B(status);
+    B(serial); B(write_lock); B(wseq); B(last_index); B(lapses); B(chord); B(reserved_hdr); B(pads); B(masks); B(clients); B(status);
 #undef B
+    line("sizeof(PadChord)", UL(sizeof(PadChord)));
+#define H(f) line("PadChord." #f, UL(offsetof(PadChord, f)))
+    H(buttons); H(deferred); H(since); H(replay); H(replay_left); H(prev);
+#undef H
     line("sizeof(PadBus.reserved_hdr)", UL(sizeof(PadBus::reserved_hdr)));
     line("sizeof(PadBus.status)", UL(sizeof(PadBus::status)));
     line("PADHOOK_LIVE", UL(PADHOOK_LIVE));

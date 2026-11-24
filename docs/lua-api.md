@@ -163,6 +163,13 @@ Hold the pad (`true`) or give it back. While held, new presses, the sticks and t
 from the game; see [abi.md](abi.md) for the exact rules on buttons held across the change. A hold
 lapses by itself 250 ms after the last `pad()`.
 
+### `pad_chord(buttons)` (1.4.0)
+
+The buttons that, pressed together, take your pad: `0xC0` for L3 + R3. The hook keeps that chord from
+the game, even when the game maps those buttons itself. You still see it raw in `pad()`, and call
+`pad_capture(true)` yourself. A chord button pressed alone reaches the game up to 150 ms late, and
+a tap of one still reaches it. `0` turns the chord off.
+
 ### `pad_config() -> {key, padmode, padsin}` or `nil, why`
 
 The game's own pad settings, read from the registry, as the client's config tool writes them:

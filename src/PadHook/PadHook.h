@@ -43,6 +43,13 @@
 //          from before the capture), so neither the camera nor a macro bar moves;
 //   4. renumbers dwPacketNumber: the number the game sees changes exactly when the state it sees
 //      changes (a button hidden or shown while the pad itself is still has a new number).
+//   5. (revision 2) the chord. A client names the buttons that take its pad together (padhook_chord, e.g.
+//      L3 + R3). While nobody holds the pad, the first of them to go down is held back from the game for
+//      up to PADHOOK_CHORD_MS: its partner arriving makes it the chord, and both stay hidden until released
+//      (the game never sees the chord, even when it maps those buttons itself); released alone before
+//      then, it is shown to the game for PADHOOK_REPLAY_READS reads (a tap still reaches it); still held
+//      alone when the time is up, the game gets it then. Only those buttons are ever delayed, and only
+//      while nobody holds the pad.
 //
 // ABI and revisions: mapping Local\FFXiPadHook_v1_<pid>, always PADHOOK_MAP_BYTES, mapped whole.
 // Offsets are frozen (test/layout_padhook.txt); new fields only go into the reserved tails, and zero
@@ -62,7 +69,7 @@
 
 #define PADHOOK_ABI_VERSION 1u             // never changes again
 #ifndef PADHOOK_REV
-#define PADHOOK_REV 1                      // this file's revision within ABI 1 (tests override it)
+#define PADHOOK_REV 2                      // this file's revision within ABI 1 (tests override it); 2: the chord
 #endif
 #define PADHOOK_MAX_CLIENTS 16
 #define PADHOOK_INDEXES 4                  // XInput user indexes 0..3
@@ -70,6 +77,8 @@
 #define PADHOOK_MAP_NAME_FMT "Local\\FFXiPadHook_v1_%lu"
 #define PADHOOK_RETRY_MS 5000              // how often a host retries padhook_join after PADHOOK_JOIN_RETRY
 #define PADHOOK_HEARTBEAT_MS 250           // a capture not renewed for this long has lapsed
+#define PADHOOK_CHORD_MS 150               // rev 2: a chord button is held back this long waiting for its partner
+#define PADHOOK_REPLAY_READS 2             // rev 2: a chord button tapped alone is shown to the game for this many reads
 #define PADHOOK_DRAIN_MS 100
 #ifndef PADHOOK_DLL
 #define PADHOOK_DLL "xinput1_3.dll"        // tests point it at a fake
@@ -151,8 +160,20 @@ struct PadClient {
     volatile LONG const* nonce_at;
     LONG nonce;
     char name[16];
-    unsigned char reserved[16];
+    unsigned long chord;             // rev 2: the buttons that take this client's pad together (0: none)
+    unsigned char reserved[12];
 };
+
+// 24 bytes (rev 2, in the bus header's reserved tail): the chord step's working state.
+struct PadChord {
+    unsigned long buttons;           // the union of the live clients' chords, refreshed every read
+    unsigned long deferred;          // chord buttons held back from the game, waiting for a partner
+    unsigned long since;             // GetTickCount() when the first of them went down
+    unsigned long replay;            // a tap released alone: shown to the game for `replay_left` more reads
+    unsigned long replay_left;
+    unsigned long prev;              // the chord buttons held at the last read
+};
+static_assert(sizeof(PadChord) == 24, "PadChord is 24 bytes forever");
 
 // 4096 bytes mapped; offsets frozen.
 struct PadBus {
@@ -178,7 +199,8 @@ struct PadBus {
     volatile LONG wseq;              // seqlock over `pads`: odd while written
     volatile LONG last_index;        // the user index that last read connected
     volatile LONG lapses;            // captures that ended by a missed heartbeat
-    unsigned char reserved_hdr[40];
+    PadChord chord;                  // rev 2 (zero: no chord, the rev 1 behaviour)
+    unsigned char reserved_hdr[16];
     PadState pads[PADHOOK_INDEXES];  // 128
     PadMask masks[PADHOOK_INDEXES];  // 192
     PadClient clients[PADHOOK_MAX_CLIENTS];   // 1024
@@ -265,6 +287,7 @@ inline void reg_unlock(PadBus* bus) { InterlockedExchange(&bus->reg_lock, 0); }
 
 inline void clear_client(PadClient& c) {
     InterlockedExchange(&c.capture, 0);
+    c.chord = 0;
     c.dispatch = nullptr;
     c.rev = 0;
     c.module = nullptr;
@@ -295,10 +318,12 @@ inline void reassign_owner(PadBus* bus, int leaving) {
 
 // Does any live client hold the pad now? (a capture whose heartbeat is older than PADHOOK_HEARTBEAT_MS
 // has lapsed; it is dropped here, once, and counted)
-inline bool captured(PadBus* bus, DWORD now) {
+inline bool captured(PadBus* bus, DWORD now, unsigned long* chords = nullptr) {
     bool any = false;
+    unsigned long all = 0;
     for (int i = 0; i < PADHOOK_MAX_CLIENTS; ++i) {
         PadClient& c = bus->clients[i];
+        if (c.occupied == 2) all |= c.chord;
         if (c.occupied != 2 || !c.capture) continue;
 #ifndef PADHOOK_FAULT_NO_HEARTBEAT
         if (now - static_cast<DWORD>(c.alive_tick) > PADHOOK_HEARTBEAT_MS) {
@@ -308,6 +333,7 @@ inline bool captured(PadBus* bus, DWORD now) {
 #endif
         any = true;
     }
+    if (chords) *chords = all;
     return any;
 }
 
@@ -320,7 +346,7 @@ inline unsigned long held_of(PadXState const& s) {
 
 // The mask rules (see the top of the file), applied to the state the original returned. Pure on its
 // inputs: tests call it directly.
-inline void apply_mask(PadMask& m, PadXState& s, bool cap) {
+inline void apply_mask(PadMask& m, PadXState& s, bool cap, unsigned long hide = 0, unsigned long force = 0) {
     unsigned long const held = held_of(s);
 #ifndef PADHOOK_FAULT_TAKE_HELD
     // held from before: what the game has already seen go down (its last state) stays the game's until
@@ -348,6 +374,7 @@ inline void apply_mask(PadMask& m, PadXState& s, bool cap) {
         if (!(m.passthru & PADHOOK_RT)) out.rt = 0;
         out.lx = out.ly = out.rx = out.ry = 0;
     }
+    out.buttons = static_cast<WORD>((out.buttons & ~(hide & 0xFFFFul)) | (force & 0xFFFFul));   // the chord step
     out.packet = 0;
     PadXState last = m.last_out;
     last.packet = 0;
@@ -359,6 +386,52 @@ inline void apply_mask(PadMask& m, PadXState& s, bool cap) {
 #endif
     m.last_out = out;
     s = out;
+}
+
+// The chord step (rev 2), before the mask: decides from the raw buttons what the game must not see yet
+// (*hide), what it must see although released (*force), and makes a completed chord a hidden press in m
+// (so it stays hidden until released, by the mask's own rule). Pure on its inputs: tests call it directly.
+inline void apply_chord(PadChord& c, PadMask& m, unsigned long held, bool cap, DWORD now,
+                        unsigned long* hide, unsigned long* force) {
+    *hide = 0;
+    *force = 0;
+    unsigned long const C = c.buttons;
+    unsigned long const on = held & C;
+#ifndef PADHOOK_FAULT_NO_CHORD
+    if (C == 0 || cap) {                             // nobody asks, or the pad is held (everything new is hidden then)
+        c.deferred = 0;
+        c.replay = c.replay_left = 0;
+        c.prev = on;
+        return;
+    }
+    if (c.replay_left > 0) {
+        *force = c.replay & ~held;
+        if (--c.replay_left == 0) c.replay = 0;
+    }
+    unsigned long const fresh = on & ~c.prev;
+    // the chord: every button of it either new in this read or still held back (never one the game already has)
+    if ((on & C) == C && ((fresh | c.deferred) & C) == C) {
+        m.masked |= C;                               // hidden until each is released
+        c.deferred = 0;
+    } else if (c.deferred != 0) {
+        if ((on & c.deferred) == 0) {                // released alone in time: a tap the game still gets
+            c.replay = c.deferred;
+            c.replay_left = PADHOOK_REPLAY_READS;
+            *force |= c.replay & ~held;
+            if (--c.replay_left == 0) c.replay = 0;
+            c.deferred = 0;
+        } else if (now - c.since > PADHOOK_CHORD_MS) {
+            c.deferred = 0;                          // held alone too long: the game's now
+        }
+    } else if (fresh != 0 && (m.masked & fresh) == 0 && (on & ~fresh) == 0) {
+        c.deferred = fresh;                          // the first chord button down: wait for its partner
+        c.since = now;
+    }
+    *hide = c.deferred;
+#else
+    (void)cap; (void)now; (void)m;
+#endif
+    c.prev = on;
 }
 
 inline void record(PadBus* bus, DWORD index, DWORD result, PadXState const* s) {
@@ -400,7 +473,18 @@ inline DWORD PADHOOK_ALIGN_STACK __stdcall dispatch(DWORD index, PadXState* stat
     DWORD const r = original(index, state);
     if (index < PADHOOK_INDEXES && state && InterlockedCompareExchange(&bus->write_lock, 1, 0) == 0) {
         record(bus, index, r, state);
-        if (r == ERROR_SUCCESS) apply_mask(bus->masks[index], *state, captured(bus, GetTickCount()));
+        if (r == ERROR_SUCCESS) {
+            DWORD const now = GetTickCount();
+            unsigned long chords = 0, hide = 0, force = 0;
+            bool const cap = captured(bus, now, &chords);
+            PadMask& m = bus->masks[index];
+            // the chord follows one pad: the user index that last read connected
+            if (static_cast<LONG>(index) == bus->last_index) {
+                bus->chord.buttons = chords;
+                apply_chord(bus->chord, m, held_of(*state), cap, now, &hide, &force);
+            }
+            apply_mask(m, *state, cap, hide, force);
+        }
         InterlockedExchange(&bus->write_lock, 0);
     } else if (r == ERROR_SUCCESS && index < PADHOOK_INDEXES && state) {
         // another thread is writing (two readers at once): hide what is hidden, change nothing else
@@ -585,6 +669,7 @@ inline int padhook_register(PadBus* bus, char const* name = nullptr) {
         if (InterlockedCompareExchange(&bus->clients[i].occupied, 1, 0) != 0) continue;
         PadClient& c = bus->clients[i];
         c.capture = 0;
+        c.chord = 0;
         c.alive_tick = static_cast<LONG>(GetTickCount());
         c.dispatch = &dispatch;
         c.rev = PADHOOK_REV;
@@ -658,6 +743,16 @@ inline void padhook_alive(PadBus* bus, int slot) {
     PadClient& c = bus->clients[slot];
     if (c.dispatch != &padhook_detail::dispatch) return;
     InterlockedExchange(&c.alive_tick, static_cast<LONG>(GetTickCount()));
+}
+
+// rev 2: the buttons that, pressed together, take this client's pad (0: none). The hook keeps the chord from
+// the game (see the top of the file); the client still sees it raw, and takes the pad itself.
+inline void padhook_chord(PadBus* bus, int slot, unsigned long buttons) {
+    if (!bus || slot < 0 || slot >= PADHOOK_MAX_CLIENTS) return;
+    PadClient& c = bus->clients[slot];
+    if (c.dispatch != &padhook_detail::dispatch) return;
+    c.chord = buttons;
+    MemoryBarrier();
 }
 
 // Is this client's capture still on (it lapses without a heartbeat)?
