@@ -101,6 +101,13 @@ UiHook, there is one bus, its ABI is 1 forever, and everything after is a revisi
   - a press the game never saw stays hidden until it is released, even after the pad is given back,
     so the game never sees half a press;
   - `dwPacketNumber` is renumbered, so it changes exactly when what the game sees changes.
+- **The chord (revision 2, nui 1.4.0).** A client can name the buttons that take its pad together
+  (`pad_chord`, for example L3 + R3). While nobody holds the pad, the first of them to go down is held
+  back from the game for up to 150 ms. If its partner arrives in that time, that is the chord, and the
+  game never sees either button, even where it maps them itself (L3 is sit or heal, R3 the camera, by
+  default). If the button is released alone in time, the game is shown the press for two reads, so a
+  tap still works. If it is still held alone when the time is up, the game gets it then. Nothing
+  else is ever delayed. A module of revision 1 leaves the field zero, and zero is no chord.
 - **A hold needs a heartbeat.** A client that has not renewed its hold for 250 ms (`pad()` renews it)
   no longer holds the pad. An addon that errors or stops polling can never leave the player without a
   controller.
