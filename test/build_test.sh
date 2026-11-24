@@ -20,7 +20,8 @@
 #   build_cache_test.sh   NuiCache.h alone (test_cache.exe: fake and real textures, every module order)
 #   build_render_test.sh  the cache through the whole renderer (test_render.exe: module DLLs built from
 #                    src/, real frames, pixels, golden_fmt.json)
-# --self-test runs every fault variant of all three (UiHook, cache, renderer).
+#   build_pad_test.sh     PadHook.h (1.3.0) with a stand-in xinput1_3.dll: patch, mask rules, heartbeat, modules
+# --self-test runs every fault variant of all four (UiHook, cache, renderer, pad hook).
 #
 # A consumer's own build_test.sh calls this with NUI_TEST_OUT=<its out dir> and then runs its tests.
 # NUI_GXX / NUI_FFXI_COPY / NUI_DLL override the compiler and the unpacked-DLL source. The copy must
@@ -103,4 +104,6 @@ echo "== renderer + cache (build_render_test.sh)"
 NUI_GXX="$GXX" NUI_TEST_OUT="$OUT" NUI_FFXI_COPY="$OUT/ffxi/FFXiMain.dll" sh ./build_render_test.sh ${1:+"$1"}
 echo "== layer build path (build_build_test.sh)"
 NUI_GXX="$GXX" NUI_TEST_OUT="$OUT" NUI_FFXI_COPY="$OUT/ffxi/FFXiMain.dll" sh ./build_build_test.sh ${1:+"$1"}
+echo "== pad hook (build_pad_test.sh)"
+NUI_GXX="$GXX" NUI_TEST_OUT="$OUT" sh ./build_pad_test.sh ${1:+"$1"}
 echo "nui library tests: all pass"

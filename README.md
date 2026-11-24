@@ -41,7 +41,8 @@ One addon, five windows: 1,046 quads in 18 batches, drawn above the game's own i
 | **One hook, however many addons** | Every addon using nui shares a single patch of a single function, through a per-process bus with a frozen layout. Addons built against different versions of nui run side by side, load and unload in any order, and need no agreement between their authors. |
 | **One texture, however many addons** | Two addons drawing the same window art, the same item icon or the same picture hold one texture between them, not two. On a scene with 25 textures that is about 12 MiB per extra addon. |
 | **Nothing to install** | The library is compiled into the addon's own DLL, so the addon ships as one folder with one DLL in it. There is no runtime, no shared component and no install step. |
-| **Fails closed** | If nui does not find exactly the code it expects in the client, it patches nothing, draws nothing, and reports why. It never writes to the game, never sends a packet, and reads nothing but the install's art files. |
+| **The controller, too** | One shared hook of `XInputGetState` reads the pad the game reads and, while an addon holds it, keeps new presses from the game. A press is never cut in half, and a hold that is not renewed lapses by itself. |
+| **Fails closed** | If nui does not find exactly the code it expects in the client, it patches nothing, draws nothing, and reports why. It never writes to the game, never sends a packet, and reads nothing but the install's art files and, for the controller, the game's own pad settings. |
 
 Built for Windower 4 and its stock Lua 5.1. The client is 32-bit, so the DLL is 32-bit.
 
@@ -439,13 +440,17 @@ The Lua module table is documented in [docs/lua-api.md](docs/lua-api.md), the dr
 | `metrics()` | font advance tables, for layout and hit testing |
 | `wintype(n)` / `wtread()` | the window style, 1 to 8 |
 | `status()` / `prof()` / `us()` | state, counters, a microsecond clock |
+| `pad_start()` / `pad()` / `pad_capture(on)` | the controller: read it, hold it (1.3.0) |
 
 A DLL can add native functions of its own to that table: `host_open` takes an array of
 `{name, lua_CFunction}` and appends them. See
 [Going quiet when the game does](#going-quiet-when-the-game-does) for why you might want to.
 
-Hit testing and input are not nui's job. It returns the font metrics and draws what it is given;
-what a click means is the addon's business.
+Hit testing is not nui's job. It returns the font metrics and draws what it is given; what a click
+means is the addon's business. The one input nui does take is the **controller** (1.3.0), because no
+Windower API offers it: `pad()` reads the pad the game reads, and `pad_capture(true)` keeps new
+presses from the game while the addon uses them. It is one shared hook of `XInputGetState`, as fail
+closed as the drawing hook. See [docs/lua-api.md](docs/lua-api.md#the-controller-130).
 
 ## Drawing offline
 
