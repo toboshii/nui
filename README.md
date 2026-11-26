@@ -511,6 +511,11 @@ pre-release ABI; the shared cache with real and fake textures across modules; th
 end to end with pixel comparisons; the command parser against both real captured layers and
 fuzzed input; and the frozen shared-memory layouts.
 
+One suite needs neither. `sh test/hd_linux/run.sh` builds the DAT reader natively with g++ on
+Linux, against a made-up install held in memory. It checks that an HD texture pack, at 2, 4 and 8
+times the game's size and in every texture format the reader takes, loads to exactly the stock
+atlas, frame recipe and glyphs. CI runs it on every pull request.
+
 ## Licence
 
 BSD 3-Clause. See [LICENSE](LICENSE).
