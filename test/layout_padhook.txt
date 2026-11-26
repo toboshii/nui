@@ -67,7 +67,8 @@ PadBus.wseq 76
 PadBus.last_index 80
 PadBus.lapses 84
 PadBus.chord 88
-PadBus.reserved_hdr 112
+PadBus.route 112
+PadBus.reserved_hdr 116
 PadBus.pads 128
 PadBus.masks 256
 PadBus.clients 448
@@ -79,10 +80,12 @@ PadChord.since 8
 PadChord.replay 12
 PadChord.replay_left 16
 PadChord.prev 20
-sizeof(PadBus.reserved_hdr) 16
+sizeof(PadBus.reserved_hdr) 12
 sizeof(PadBus.status) 192
 PADHOOK_LIVE 0
 PADHOOK_WAIT 1
 PADHOOK_BLOCKED 2
 PADHOOK_SRC_XINPUT 1
 PADHOOK_SRC_DINPUT 2
+PADHOOK_ROUTE_EXPORT 0
+PADHOOK_ROUTE_WRAPPER 1

@@ -1,6 +1,6 @@
 {
   "note": "test/test_render.exe --update-golden; a hash may change only with its kind's fmt (src/cache.hpp)",
-  "atlas.fmt": 3,
+  "atlas.fmt": 4,
   "atlas.t1": "eedbdf5e947dd692",
   "atlas.t2": "d7a50559c8547711",
   "atlas.t3": "31d77481605ea312",

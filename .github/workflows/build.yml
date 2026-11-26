@@ -26,6 +26,14 @@ jobs:
       - name: An HD texture pack loads as the stock art
         run: sh test/hd_linux/run.sh
 
+      - name: The controller hook on the client's real wrapper bytes
+        run: |
+          sudo apt-get install -y g++-multilib
+          sh test/pad_linux/run.sh --self-test
+
+      - name: The controller hook's Windows tests build (they run on Windows)
+        run: NUI_NORUN=1 sh test/build_pad_test.sh
+
       - name: Frozen shared-memory layouts
         run: python3 test/frozen_check.py
 

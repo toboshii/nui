@@ -1,9 +1,14 @@
 // pad_mod.cpp - a second module on the PadHook bus, for pad_test.exe (built as pad_mod_r<REV>.dll with
-// -DPADHOOK_REV=<n>). It leaves in DllMain, as a real module does.
+// -DPADHOOK_REV=<n>, or as pad_mod_r2.dll with -DPADMOD_REV2 from the frozen revision 2 header). It leaves
+// in DllMain, as a real module does.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#ifdef PADMOD_REV2
+#include "padhook_rev2/PadHook.h"
+#else
 #include "../src/PadHook/PadHook.h"
+#endif
 
 #ifndef PADMOD_NAME
 #define PADMOD_NAME "mod"

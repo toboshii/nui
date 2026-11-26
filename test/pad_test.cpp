@@ -1,11 +1,26 @@
-// pad_test.cpp - PadHook.h against a stand-in xinput1_3.dll (pad_fake_xinput.cpp), with the exact
-// entry shape of the real one, in a real process: the patch bytes, pass-through, recording, the mask
-// rules, packet renumbering, the heartbeat, a second module at a higher revision taking the dispatch
-// and handing it back from its DllMain, and the frozen layout. This exe is module A.
+// pad_test.cpp - PadHook.h in a real process, against stand-ins with the exact shapes of the real code. This
+// exe is module A.
 //
-//   pad_test.exe main <layout_padhook.txt>   (PADHOOK_DLL = pad_fake_xinput.dll)
+//   pad_test.exe main <layout_padhook.txt>   route 0 on pad_fake_xinput.dll (the real hot-patchable entry
+//                                            shape), with no client module loaded: the patch bytes,
+//                                            pass-through, recording, the mask rules, renumbering, the
+//                                            heartbeat, the chord, a revision 4 module (pad_mod.cpp) taking
+//                                            the dispatch and handing it back from its DllMain, the layout
+//   pad_test.exe nomatch                     a client module whose wrapper the signature does not match:
+//                                            route 0 on pad_fake_xinput.dll, and the status says why
+//   pad_test.exe both                        both routes available: route 1 is taken, the export untouched
+//   pad_test.exe r2first                     a revision 2 module patches route 0 first, the client's wrapper
+//                                            there too: revision 3 joins that patch and adds no second one
 //   pad_test.exe foreign                     another tool's hot-patch already on the entry: refused
-//   pad_test_nohot.exe nohot                 (PADHOOK_DLL = pad_fake_nohot.dll) not hot-patchable: refused
+//   pad_test_nohot.exe nohot                 an entry that is not hot-patchable, with the no-match client
+//                                            module: refused, bytes untouched, both reasons given
+//   pad_test_nohot.exe wrapper               the field case: route 1 on the stand-in client module
+//                                            (game/FFXiMain.dll, pad_game.cpp) and its shim (xinputdll.dll,
+//                                            pad_shim.cpp), which calls pad_fake_nohot.dll. A revision 2
+//                                            module refuses route 0 first and route 1 clears that. Every
+//                                            check of `main` runs through the client's wrapper, then the
+//                                            client's own life: the shim loaded late, pinned, unloaded and
+//                                            loaded again, F rewritten, and the revision 2 module driving.
 #include "../src/PadHook/PadHook.h"
 
 #include "pad_layout.hpp"
@@ -26,15 +41,20 @@ typedef void(__cdecl* set_fn)(int, int, int, int, int, int, int);
 typedef int(__cdecl* join_fn)();
 typedef void(__cdecl* cap_fn)(int);
 typedef void*(__cdecl* ptr_fn)();
+typedef DWORD(__cdecl* game_read_fn)(DWORD, void*);
+typedef int(__cdecl* game_setup_fn)();
+typedef void(__cdecl* game_void_fn)();
+typedef void(__cdecl* game_point_fn)(int);
 
-padhook_get_fn g_get = nullptr;
+padhook_get_fn g_get = nullptr;          // the fake's export, read directly (route 0)
+game_read_fn g_game_read = nullptr;      // the stand-in client's call into its wrapper (route 1)
 set_fn g_set = nullptr;
 
-constexpr unsigned A = 0x1000, B = 0x2000, X = 0x4000, Y = 0x8000;
+constexpr unsigned A = 0x1000, B = 0x2000, X = 0x4000, Y = 0x8000, START = 0x0010;
 
 PadXState read(DWORD index = 0, DWORD* r = nullptr) {
     PadXState s {};
-    DWORD const rr = g_get(index, &s);
+    DWORD const rr = g_game_read ? g_game_read(index, &s) : g_get(index, &s);
     if (r) *r = rr;
     return s;
 }
@@ -51,32 +71,16 @@ bool load_fake(char const* dll) {
     return g_get && g_set;
 }
 
-int run_main(char const* layout_path) {
-    PadBus* bus = padhook_attach();
-    check("attach", bus != nullptr);
-    if (!bus) return 1;
+template <typename T> T fn_of(HMODULE m, char const* name) {
+    return m ? reinterpret_cast<T>(reinterpret_cast<void*>(GetProcAddress(m, name))) : nullptr;
+}
 
-    // not loaded yet: retry, and nothing installed
-    check("not loaded: retry", padhook_join(bus, "test") == PADHOOK_JOIN_RETRY, bus->status);
-    check("not loaded: says so", std::strstr(bus->status, "not loaded") != nullptr, bus->status);
-    check("simulated missing: retry", padhook_join(bus, "test", true) == PADHOOK_JOIN_RETRY);
-    check("not loaded: waiting", padhook_state(bus) == PADHOOK_WAIT);
+bool has(char const* text, char const* part) { return std::strstr(text, part) != nullptr; }
 
-    check("fake loads", load_fake(PADHOOK_DLL));
-    if (!g_get) return 1;
-    auto const* site = reinterpret_cast<unsigned char const*>(reinterpret_cast<void*>(g_get));
-    check("fake is hot-patchable", site[0] == 0x8B && site[1] == 0xFF && site[-1] == 0x90);
-    PadXState raw = press(A);
-    check("unhooked read", raw.buttons == A);
-
-    int const slot = padhook_join(bus, "test");
-    check("join", slot >= 0, bus->status);
-    check("patched entry EB F9", site[0] == 0xEB && site[1] == 0xF9);
-    check("patched padding E9", site[-5] == 0xE9);
-    check("live", padhook_state(bus) == PADHOOK_LIVE);
-    check("drives", bus->owner_slot == slot && *bus->dispatch_ptr == &padhook_detail::dispatch);
-    check("one install", bus->installs == 1);
-
+// Everything that does not depend on the route: pass-through, recording, the mask, renumbering, the
+// heartbeat, the chord, a revision 4 module taking the dispatch and handing it back. Reads go through
+// read(), which is the export (route 0) or the client's wrapper (route 1).
+void shared_checks(PadBus* bus, int slot) {
     // pass-through and recording
     LONG const calls0 = bus->calls;
     PadXState s = press(A, 0, 0, 1234);
@@ -186,43 +190,45 @@ int run_main(char const* layout_path) {
         press(0);
     }
 
-    // a second module at revision 3 takes the dispatch; its DllMain hands it back
-    HMODULE m2 = LoadLibraryA("pad_mod_r3.dll");
-    check("module r3 loads", m2 != nullptr);
+    // a second module at revision 4 takes the dispatch; its DllMain hands it back
+    HMODULE m2 = LoadLibraryA("pad_mod_r4.dll");
+    check("module r4 loads", m2 != nullptr);
     if (m2) {
-        auto mjoin = reinterpret_cast<join_fn>(reinterpret_cast<void*>(GetProcAddress(m2, "mod_join")));
-        auto mcap = reinterpret_cast<cap_fn>(reinterpret_cast<void*>(GetProcAddress(m2, "mod_capture")));
-        auto mdis = reinterpret_cast<ptr_fn>(reinterpret_cast<void*>(GetProcAddress(m2, "mod_dispatch")));
+        auto mjoin = fn_of<join_fn>(m2, "mod_join");
+        auto mcap = fn_of<cap_fn>(m2, "mod_capture");
+        auto mdis = fn_of<ptr_fn>(m2, "mod_dispatch");
         int const s2 = mjoin ? mjoin() : -1;
-        check("r3 joins", s2 >= 0 && s2 != slot);
-        check("r3 drives", bus->owner_slot == s2 && reinterpret_cast<void*>(*bus->dispatch_ptr) == mdis());
+        check("r4 joins", s2 >= 0 && s2 != slot);
+        check("r4 drives", bus->owner_slot == s2 && reinterpret_cast<void*>(*bus->dispatch_ptr) == mdis());
         check("no second install", bus->installs == 1);
         s = press(A);
-        check("r3 dispatches", s.buttons == A);
+        check("r4 dispatches", s.buttons == A);
         mcap(1);
         s = press(A | B);
-        check("r3's capture hides for everyone", (s.buttons & B) == 0 && (s.buttons & A) != 0);
+        check("r4's capture hides for everyone", (s.buttons & B) == 0 && (s.buttons & A) != 0);
         press(0);
         FreeLibrary(m2);
-        check("r3 left: the dispatch is back with A", bus->owner_slot == slot && *bus->dispatch_ptr == &padhook_detail::dispatch);
+        check("r4 left: the dispatch is back with A", bus->owner_slot == slot && *bus->dispatch_ptr == &padhook_detail::dispatch);
         s = press(A);
-        check("after r3 unloaded: reads still work", s.buttons == A, "");
-        check("r3's capture went with it", s.buttons == A);
+        check("after r4 unloaded: reads still work", s.buttons == A, "");
+        check("r4's capture went with it", s.buttons == A);
         press(0);
     }
+}
 
-    // leaving: a pass-through, the bytes stay
+// leaving: a pass-through, then a rejoin without a second install
+void leave_and_rejoin(PadBus* bus, int slot) {
     padhook_unregister(bus, slot, true);
     check("left: nobody drives", *bus->dispatch_ptr == nullptr && bus->owner_slot == -1);
     LONG const c0 = bus->calls;
-    s = press(X, 0, 0, 77);
+    PadXState const s = press(X, 0, 0, 77);
     check("pass-through with nobody", s.buttons == X && s.lx == 77 && bus->calls == c0);
-    check("patch kept", site[0] == 0xEB && site[1] == 0xF9);
     int const again = padhook_join(bus, "test");
     check("rejoin", again >= 0 && bus->installs == 1);
     padhook_unregister(bus, again, true);
+}
 
-    // the frozen layout
+void layout_check(char const* layout_path) {
     char text[8192];
     padhook_layout_text(text, sizeof(text));
     std::string want;
@@ -242,10 +248,72 @@ int run_main(char const* layout_path) {
     }
     check("layout_padhook.txt", got == text, "");
     if (got != text) std::printf("--- header layout:\n%s", text);
+}
+
+int run_main(char const* layout_path) {
+    PadBus* bus = padhook_attach();
+    check("attach", bus != nullptr);
+    if (!bus) return 1;
+
+    // no client module, and the DLL not loaded yet: retry, and nothing installed
+    check("not loaded: retry", padhook_join(bus, "test") == PADHOOK_JOIN_RETRY, bus->status);
+    check("not loaded: says so", has(bus->status, "is not loaded (the game reads"), bus->status);
+    check("no client module: says so", has(bus->status, "FFXiMain.dll is not loaded"), bus->status);
+    check("simulated missing: retry", padhook_join(bus, "test", true) == PADHOOK_JOIN_RETRY);
+    check("simulated missing: both routes", has(bus->status, "wrapper was not found (simulated)") && has(bus->status, "not loaded (simulated)"),
+          bus->status);
+    check("not loaded: waiting", padhook_state(bus) == PADHOOK_WAIT);
+
+    check("fake loads", load_fake(PADHOOK_DLL));
+    if (!g_get) return 1;
+    auto const* site = reinterpret_cast<unsigned char const*>(reinterpret_cast<void*>(g_get));
+    check("fake is hot-patchable", site[0] == 0x8B && site[1] == 0xFF && site[-1] == 0x90);
+    PadXState raw = press(A);
+    check("unhooked read", raw.buttons == A);
+
+    int const slot = padhook_join(bus, "test");
+    check("join", slot >= 0, bus->status);
+    check("route 0", bus->route == PADHOOK_ROUTE_EXPORT);
+    check("patched entry EB F9", site[0] == 0xEB && site[1] == 0xF9);
+    check("patched padding E9", site[-5] == 0xE9);
+    check("live", padhook_state(bus) == PADHOOK_LIVE);
+    check("drives", bus->owner_slot == slot && *bus->dispatch_ptr == &padhook_detail::dispatch);
+    check("one install", bus->installs == 1);
+    check("status: route 0 by name", has(bus->status, "!XInputGetState") && has(bus->status, "(rev 3)"), bus->status);
+    char line[256];
+    padhook_describe(bus, line, sizeof(line));
+    check("describe: route 0", has(line, "live at " PADHOOK_DLL "!XInputGetState") && has(line, "1 client: test r3 (drives)"), line);
+    check("pin: nothing to pin on route 0", !padhook_pin(bus) && !padhook_shim_loaded(bus));
+
+    shared_checks(bus, slot);
+    leave_and_rejoin(bus, slot);
+    check("patch kept", site[0] == 0xEB && site[1] == 0xF9);
+    layout_check(layout_path);
+    return 0;
+}
+
+// a client module with no matching wrapper (a client update): route 0 takes over
+int run_nomatch() {
+    HMODULE game = LoadLibraryA("game_nomatch\\FFXiMain.dll");
+    check("no-match client loads", game != nullptr);
+    if (!game) return 1;
+    auto const* wrapper = static_cast<unsigned char const*>(fn_of<ptr_fn>(game, "game_wrapper")());
+    unsigned char before[48];
+    std::memcpy(before, wrapper, sizeof(before));
+    check("fake loads", load_fake(PADHOOK_DLL));
+    PadBus* bus = padhook_attach();
+    int const slot = padhook_join(bus, "test");
+    check("join on route 0", slot >= 0 && bus->route == PADHOOK_ROUTE_EXPORT, bus->status);
+    check("status: why not route 1", has(bus->status, "FFXiMain's XInput wrapper was not found"), bus->status);
+    check("the client's wrapper untouched", std::memcmp(before, wrapper, sizeof(before)) == 0);
+    PadXState const s = press(A);
+    check("reads through route 0", s.buttons == A && bus->calls >= 1);
+    padhook_unregister(bus, slot, true);
     return 0;
 }
 
 int run_foreign() {
+    check("no-match client loads", LoadLibraryA("game_nomatch\\FFXiMain.dll") != nullptr);
     check("fake loads", load_fake(PADHOOK_DLL));
     if (!g_get) return 1;
     // another tool hot-patched it first
@@ -257,13 +325,14 @@ int run_foreign() {
     VirtualProtect(site - 5, 7, old, &old);
     PadBus* bus = padhook_attach();
     check("foreign: blocked", padhook_join(bus, "test") == PADHOOK_JOIN_BLOCKED, bus->status);
-    check("foreign: says so", std::strstr(bus->status, "already hooked") != nullptr, bus->status);
+    check("foreign: says so", has(bus->status, "already hooked"), bus->status);
     check("foreign: entry untouched", site[0] == 0x8B && site[1] == 0xFF);
     check("foreign: never retried", padhook_join(bus, "test") == PADHOOK_JOIN_BLOCKED);
     return 0;
 }
 
 int run_nohot() {
+    check("no-match client loads", LoadLibraryA("game_nomatch\\FFXiMain.dll") != nullptr);
     check("fake loads", load_fake(PADHOOK_DLL));
     if (!g_get) return 1;
     auto const* site = reinterpret_cast<unsigned char const*>(reinterpret_cast<void*>(g_get));
@@ -271,11 +340,199 @@ int run_nohot() {
     std::memcpy(before, site - 5, 7);
     PadBus* bus = padhook_attach();
     check("nohot: blocked", padhook_join(bus, "test") == PADHOOK_JOIN_BLOCKED, bus->status);
-    check("nohot: says so", std::strstr(bus->status, "not hot-patchable") != nullptr, bus->status);
+    check("nohot: says so", has(bus->status, "not hot-patchable"), bus->status);
+    check("nohot: and why not route 1", has(bus->status, "FFXiMain's XInput wrapper was not found"), bus->status);
     check("nohot: bytes untouched", std::memcmp(before, site - 5, 7) == 0);
     check("nohot: state blocked", padhook_state(bus) == PADHOOK_BLOCKED);
+    char line[256];
+    padhook_describe(bus, line, sizeof(line));
+    check("nohot: describe", has(line, "blocked: FFXiMain's XInput wrapper was not found") && has(line, "not hot-patchable"), line);
     PadXState const s = press(A);
     check("nohot: the game still reads", s.buttons == A);
+    padhook_join(bus, "test", true);
+    check("nohot: nosig keeps route 0's real reason", has(bus->status, "not hot-patchable") && !has(bus->status, "simulated"),
+          bus->status);
+    return 0;
+}
+
+// both routes available: route 1 first, and the export is left alone
+int run_both() {
+    HMODULE game = LoadLibraryA("game\\FFXiMain.dll");
+    check("client loads", game != nullptr);
+    if (!game) return 1;
+    check("fake loads", load_fake(PADHOOK_DLL));
+    check("client setup", fn_of<game_setup_fn>(game, "game_setup")() == 1);
+    auto const* entry = reinterpret_cast<unsigned char const*>(reinterpret_cast<void*>(g_get));
+    auto const* wrapper = static_cast<unsigned char const*>(fn_of<ptr_fn>(game, "game_wrapper")());
+    PadBus* bus = padhook_attach();
+    int const slot = padhook_join(bus, "test");
+    check("both: route 1 taken", slot >= 0 && bus->route == PADHOOK_ROUTE_WRAPPER && wrapper[9] == 0xB8, bus->status);
+    check("both: the export untouched", entry[0] == 0x8B && entry[1] == 0xFF && entry[-5] == 0x90);
+    check("both: pinned at install", padhook_pin(bus));
+    g_game_read = fn_of<game_read_fn>(game, "game_read");
+    LONG const c0 = bus->calls;
+    PadXState s = press(A);
+    check("both: the client's read, through the dispatcher once", s.buttons == A && bus->calls == c0 + 1);
+    g_game_read = nullptr;
+    s = press(B);
+    check("both: a direct export read is not hooked", s.buttons == B && bus->calls == c0 + 1);
+    padhook_unregister(bus, slot, true);
+    return 0;
+}
+
+// a revision 2 module patched route 0 first: revision 3 joins it, and the wrapper stays as the client has it
+int run_r2first() {
+    HMODULE game = LoadLibraryA("game\\FFXiMain.dll");
+    check("client loads", game != nullptr);
+    if (!game) return 1;
+    check("fake loads", load_fake(PADHOOK_DLL));
+    check("client setup", fn_of<game_setup_fn>(game, "game_setup")() == 1);
+    auto const* entry = reinterpret_cast<unsigned char const*>(reinterpret_cast<void*>(g_get));
+    auto const* wrapper = static_cast<unsigned char const*>(fn_of<ptr_fn>(game, "game_wrapper")());
+    HMODULE r2 = LoadLibraryA("pad_mod_r2x.dll");
+    check("module r2 loads", r2 != nullptr);
+    if (!r2) return 1;
+    PadBus* bus = padhook_attach();
+    int const s2 = fn_of<join_fn>(r2, "mod_join")();
+    check("r2: route 0", s2 >= 0 && entry[0] == 0xEB && entry[1] == 0xF9 && bus->route == PADHOOK_ROUTE_EXPORT, bus->status);
+    int const slot = padhook_join(bus, "test");
+    check("r3 joins the same patch", slot >= 0 && bus->installs == 1 && bus->route == PADHOOK_ROUTE_EXPORT);
+    check("the wrapper untouched", wrapper[9] == 0xA1);
+    check("r3 drives", *bus->dispatch_ptr == &padhook_detail::dispatch);
+    g_game_read = fn_of<game_read_fn>(game, "game_read");
+    LONG const c0 = bus->calls;
+    PadXState const s = press(A);
+    check("the client's read: through the dispatcher once", s.buttons == A && bus->calls == c0 + 1);
+    padhook_unregister(bus, slot, true);
+    FreeLibrary(r2);
+    return 0;
+}
+
+// the field case: route 0 refuses, route 1 holds the pad through the client's own wrapper
+int run_wrapper() {
+    PadBus* bus = padhook_attach();
+    check("fake loads", load_fake(PADHOOK_DLL));
+    if (!g_get) return 1;
+    auto const* entry = reinterpret_cast<unsigned char const*>(reinterpret_cast<void*>(g_get));
+    unsigned char entry_before[7];
+    std::memcpy(entry_before, entry - 5, 7);
+
+    // a revision 2 module comes first: route 0 refuses, and it blocks the bus
+    HMODULE r2 = LoadLibraryA("pad_mod_r2.dll");
+    check("module r2 loads", r2 != nullptr);
+    if (!r2) return 1;
+    auto r2join = fn_of<join_fn>(r2, "mod_join");
+    auto r2cap = fn_of<cap_fn>(r2, "mod_capture");
+    auto r2dis = fn_of<ptr_fn>(r2, "mod_dispatch");
+    check("r2: route 0 refused", r2join() == PADHOOK_JOIN_BLOCKED && bus->blocked == 1, bus->status);
+    // before the client module is loaded, revision 3 has no wrapper either. Route 1 can still work, so it waits
+    check("no client yet: retry", padhook_join(bus, "test") == PADHOOK_JOIN_RETRY, bus->status);
+    check("no client yet: waiting", padhook_state(bus) == PADHOOK_WAIT && bus->blocked == 1);
+    check("no client yet: both reasons", has(bus->status, "FFXiMain.dll is not loaded") && has(bus->status, "not hot-patchable"), bus->status);
+
+    // the client module, before it has loaded its shim (Enable XInput off, or input init not done)
+    HMODULE game = LoadLibraryA("game\\FFXiMain.dll");
+    check("client loads", game != nullptr);
+    if (!game) return 1;
+    g_game_read = fn_of<game_read_fn>(game, "game_read");
+    auto game_setup = fn_of<game_setup_fn>(game, "game_setup");
+    auto game_unload = fn_of<game_void_fn>(game, "game_unload");
+    auto game_point = fn_of<game_point_fn>(game, "game_point");
+    auto* wrapper = static_cast<unsigned char const*>(fn_of<ptr_fn>(game, "game_wrapper")());
+    auto const* slots = reinterpret_cast<volatile DWORD const*>(fn_of<ptr_fn>(game, "game_slots")());
+    // F holds another function than the shim's XInputGetState_: not route 1 now, but tried again
+    check("client setup", game_setup() == 1);
+    game_point(1);
+    check("slots mismatch: retry", padhook_join(bus, "test") == PADHOOK_JOIN_RETRY, bus->status);
+    check("slots mismatch: says so", has(bus->status, "function slot does not hold"), bus->status);
+    check("slots mismatch: not patched", wrapper[9] == 0xA1);
+    game_point(0);
+    game_unload();
+    DWORD r = 0;
+    read(0, &r);
+    check("no shim: the wrapper's own failure", r == padhook_detail::kWrapperFail);
+
+    int const slot = padhook_join(bus, "test");
+    check("join: route 1", slot >= 0 && bus->route == PADHOOK_ROUTE_WRAPPER, bus->status);
+    check("route 1 clears blocked", bus->blocked == 0 && padhook_state(bus) == PADHOOK_LIVE);
+    check("site is the GetState wrapper", bus->site == reinterpret_cast<std::uintptr_t>(wrapper));
+    auto const block = reinterpret_cast<std::uintptr_t>(bus->block);
+    check("patched: mov eax, thunk", wrapper[9] == 0xB8 && padhook_detail::le32(wrapper + 10) == block + padhook_detail::kThunkAt);
+    check("patched: H kept", padhook_detail::le32(wrapper + 1) == reinterpret_cast<std::uintptr_t>(&slots[0]));
+    check("original is the adapter", reinterpret_cast<std::uintptr_t>(bus->original) == block + padhook_detail::kAdapterAt);
+    check("the export untouched", std::memcmp(entry_before, entry - 5, 7) == 0);
+    check("status", has(bus->status, "hook installed at FFXiMain's XInput wrapper") && has(bus->status, "(rev 3)"), bus->status);
+    char line[256];
+    padhook_describe(bus, line, sizeof(line));
+    check("describe: not loaded yet", has(line, "live at FFXiMain's XInput wrapper") && has(line, "has not loaded xinputdll.dll yet"), line);
+    check("pin: nothing to pin yet", !padhook_pin(bus) && !padhook_shim_loaded(bus));
+    LONG const c0 = bus->calls;
+    read(0, &r);
+    check("no shim: still the wrapper's failure, no dispatch", r == padhook_detail::kWrapperFail && bus->calls == c0);
+
+    // input init: the client loads the shim and writes the slots
+    check("client setup", game_setup() == 1 && slots[0] != 0);
+    HMODULE const shim = GetModuleHandleA("xinputdll.dll");
+    check("the shim is the handle", reinterpret_cast<DWORD>(shim) == slots[0]);
+    check("pin", padhook_pin(bus) && padhook_shim_loaded(bus));
+    padhook_describe(bus, line, sizeof(line));
+    check("describe: loaded", has(line, "live at FFXiMain's XInput wrapper") && !has(line, "not loaded") && has(line, "1 client: test r3 (drives)"),
+          line);
+
+    shared_checks(bus, slot);
+
+    // a re-enumeration rewrites all four slots with the same values: nothing changes
+    game_setup();
+    PadXState s = press(A);
+    check("rewritten slots: reads work", s.buttons == A && wrapper[9] == 0xB8);
+    press(0);
+
+    // the client moves F (a reload at another address): the next read uses the new function
+    game_point(1);
+    LONG const c1 = bus->calls;
+    s = press(A);
+    check("F moved: the new function, through the dispatcher", s.buttons == (A | START) && bus->calls == c1 + 1);
+    game_point(0);
+    s = press(A);
+    check("F back", s.buttons == A);
+    press(0);
+
+    // the unloader: frees the shim and zeros H. Pinned, the shim stays mapped
+    game_unload();
+    check("unloaded: H zero", slots[0] == 0);
+    check("unloaded: the shim stays mapped (pinned)", GetModuleHandleA("xinputdll.dll") == shim);
+    LONG const c2 = bus->calls;
+    read(0, &r);
+    check("unloaded: the wrapper's own failure, no dispatch", r == padhook_detail::kWrapperFail && bus->calls == c2);
+    check("unloaded: describe says so", (padhook_describe(bus, line, sizeof(line)), has(line, "has not loaded xinputdll.dll yet")), line);
+    check("reloaded", game_setup() == 1 && slots[0] == reinterpret_cast<DWORD>(shim));
+    s = press(B);
+    check("reloaded: reads through the dispatcher", s.buttons == B && bus->calls == c2 + 1);
+    press(0);
+
+    // the revision 2 module joins the route 1 bus: it registers, and drives once module A leaves
+    int const s2 = r2join();
+    check("r2 joins route 1", s2 >= 0 && s2 != slot && bus->installs == 1);
+    check("r2 does not drive (A is r3)", bus->owner_slot == slot);
+    padhook_unregister(bus, slot, true);
+    check("A left: r2 drives", reinterpret_cast<void*>(*bus->dispatch_ptr) == r2dis());
+    LONG const c3 = bus->calls;
+    s = press(A);
+    check("r2's dispatcher through the thunk and the adapter", s.buttons == A && bus->calls == c3 + 1);
+    r2cap(1);
+    s = press(A | X);
+    check("r2's capture hides", (s.buttons & X) == 0 && (s.buttons & A) != 0);
+    r2cap(0);
+    press(0);
+    int const back = padhook_join(bus, "test");
+    check("A again: drives (r3 over r2)", back >= 0 && *bus->dispatch_ptr == &padhook_detail::dispatch);
+    FreeLibrary(r2);
+    check("r2 gone: A still drives", bus->owner_slot == back);
+    s = press(Y);
+    check("after r2 unloaded: reads work", s.buttons == Y);
+    press(0);
+    leave_and_rejoin(bus, back);
+    check("patch kept", wrapper[9] == 0xB8);
     return 0;
 }
 
@@ -284,8 +541,12 @@ int run_nohot() {
 int main(int argc, char** argv) {
     std::string const mode = argc > 1 ? argv[1] : "main";
     if (mode == "main") run_main(argc > 2 ? argv[2] : "layout_padhook.txt");
+    else if (mode == "nomatch") run_nomatch();
+    else if (mode == "both") run_both();
+    else if (mode == "r2first") run_r2first();
     else if (mode == "foreign") run_foreign();
     else if (mode == "nohot") run_nohot();
+    else if (mode == "wrapper") run_wrapper();
     else { std::printf("unknown mode %s\n", mode.c_str()); return 2; }
     std::printf("pad_test %s: %d passed, %d failed\n", mode.c_str(), g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

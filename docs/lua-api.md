@@ -130,16 +130,22 @@ these.
 ## The controller (1.3.0)
 
 nui can read the pad the game reads, and keep presses from the game while the addon uses them. It
-hooks `XInputGetState` once per process, shared by every nui module (PadHook 1, see
-[abi.md](abi.md)). Only XInput is read in this version: with the client's **Enable XInput** setting off,
-the game uses DirectInput and `pad_start()` keeps asking to be retried.
+hooks the client's XInput read once per process, shared by every nui module (PadHook 1, see
+[abi.md](abi.md)). Since 1.5.0 the hook patches the client's own XInput wrapper in `FFXiMain.dll`.
+Where that wrapper is not found, it hot-patches `xinput1_3.dll!XInputGetState` instead. Only XInput is
+read in this version. With the client's **Enable XInput** setting off, the game uses DirectInput, and
+`pad()` never sees a pad.
 
 ### `pad_start([flags]) -> ok, msg [, retry_ms]`
 
-Join the pad hook, patching `XInputGetState` if no module has. As `start()`: `retry_ms` means try again
-later (`xinput1_3.dll` is not loaded yet); no `retry_ms` means never in this process (the function is
-already hooked by another tool, or is not hot-patchable), and `msg` says so. `flags` may contain
-`nosig`, which always takes the not-loaded path (the fail-closed test).
+Join the pad hook, and patch the client's XInput read if no module has. On the client's wrapper
+(1.5.0), this succeeds before the client loads its XInput shim, and in DirectInput mode too.
+
+When the wrapper is not found, the hook tries `xinput1_3.dll!XInputGetState`. As with `start()`,
+`retry_ms` then means try again later (`xinput1_3.dll` is not loaded yet, or the wrapper can still
+work). No `retry_ms` means never in this process: the wrapper is refused for good, and the function
+is already hooked by another tool or is not hot-patchable. `msg` gives the reason for both routes. `flags` may contain `nosig`, which always takes both not-found paths (the
+fail-closed test).
 
 ### `pad() -> seq, buttons, lt, rt, lx, ly, rx, ry, index, holding`
 
@@ -155,7 +161,9 @@ Returns numbers, not a table, so polling it every frame allocates nothing.
 | `index` | the XInput user index, -1 when not connected |
 | `holding` | this module holds the pad |
 
-Each call is also the hold's heartbeat: poll it from `prerender`.
+Each call is also the hold's heartbeat: poll it from `prerender`. On the client's wrapper, the first
+call that finds the client's shim loaded also pins `xinputdll.dll`, so the client can never unload it
+while a read is on its way through the hook.
 
 ### `pad_capture(on)`
 
@@ -180,6 +188,17 @@ game action (5 Cancel, 6 Main menu, 7 Confirm, 8 Active window, ...).
 
 `state` (`live`, `waiting`, `blocked`, `no bus`), `describe` (one line), `joined`, `holding`, `calls`,
 `clients`, `masked`, `hidden`, `lapses`, `reads`, `source`, `site`, `rev`, `owner_rev`.
+
+Since 1.5.0 it also has:
+
+| Field | What |
+|---|---|
+| `route` | `wrapper` (the client's XInput wrapper), `export` (`xinput1_3.dll!XInputGetState`), or `none` while nothing is patched |
+| `shim` | on `wrapper`: the client has loaded `xinputdll.dll` (it has not with Enable XInput off) |
+| `pinned` | on `wrapper`: this module has pinned `xinputdll.dll` |
+
+`site` is the patched address: the wrapper on `wrapper`, the function on `export`. `describe` names the
+route, for example `live at FFXiMain's XInput wrapper 10008EA0; 1 client: chronicle r3 (drives)`.
 
 ### `pad_stop()`
 

@@ -41,8 +41,9 @@ One addon, five windows: 1,046 quads in 18 batches, drawn above the game's own i
 | **One hook, however many addons** | Every addon using nui shares a single patch of a single function, through a per-process bus with a frozen layout. Addons built against different versions of nui run side by side, load and unload in any order, and need no agreement between their authors. |
 | **One texture, however many addons** | Two addons drawing the same window art, the same item icon or the same picture hold one texture between them, not two. On a scene with 25 textures that is about 12 MiB per extra addon. |
 | **Nothing to install** | The library is compiled into the addon's own DLL, so the addon ships as one folder with one DLL in it. There is no runtime, no shared component and no install step. |
-| **The controller, too** | One shared hook of `XInputGetState` reads the pad the game reads and, while an addon holds it, keeps new presses from the game. A press is never cut in half, and a hold that is not renewed lapses by itself. |
-| **Fails closed** | If nui does not find exactly the code it expects in the client, it patches nothing, draws nothing, and reports why. It never writes to the game, never sends a packet, and reads nothing but the install's art files and, for the controller, the game's own pad settings. |
+| **The controller, too** | One shared hook reads the pad the game reads and, while an addon holds it, keeps new presses from the game. A press is never cut in half, and a hold that is not renewed lapses by itself. |
+| **Fails closed** | If nui does not find exactly the code it expects in the client, it patches nothing, draws nothing, and reports why. It never sends a packet, and reads nothing but the install's art files and, for the controller, the game's own pad settings. |
+| **Two patches in the client's code** | nui patches the client's code in two places. Each is found by its byte signature and is never undone. The drawing hook patches the start of the client's `EndScene` wrapper. The controller hook (1.5.0) changes one instruction of the client's XInput wrapper. Where that wrapper is not found, the controller hook patches `xinput1_3.dll!XInputGetState` instead, if that DLL is hot-patchable. nui writes no other code of the client and none of its data. The one exception is the pad state that the client's own read returns: the controller hook masks it while an addon holds the pad. |
 
 Built for Windower 4 and its stock Lua 5.1. The client is 32-bit, so the DLL is 32-bit.
 
@@ -449,8 +450,11 @@ A DLL can add native functions of its own to that table: `host_open` takes an ar
 Hit testing is not nui's job. It returns the font metrics and draws what it is given; what a click
 means is the addon's business. The one input nui does take is the **controller** (1.3.0), because no
 Windower API offers it: `pad()` reads the pad the game reads, and `pad_capture(true)` keeps new
-presses from the game while the addon uses them. It is one shared hook of `XInputGetState`, as fail
-closed as the drawing hook. See [docs/lua-api.md](docs/lua-api.md#the-controller-130).
+presses from the game while the addon uses them. It is one shared hook, as fail closed as the drawing
+hook. Since 1.5.0 it patches the client's own XInput wrapper in `FFXiMain.dll`, which works with every
+build of `xinput1_3.dll`. Where that wrapper is not found, it falls back to a hot patch of
+`xinput1_3.dll!XInputGetState`. See [docs/lua-api.md](docs/lua-api.md#the-controller-130) and
+[docs/abi.md](docs/abi.md#padhook-1).
 
 ## Drawing offline
 
@@ -515,6 +519,13 @@ One suite needs neither. `sh test/hd_linux/run.sh` builds the DAT reader nativel
 Linux, against a made-up install held in memory. It checks that an HD texture pack, at 2, 4 and 8
 times the game's size and in every texture format the reader takes, loads to exactly the stock
 atlas, frame recipe and glyphs. CI runs it on every pull request.
+
+The controller hook has two suites of its own, and neither needs game files.
+`sh test/pad_linux/run.sh --self-test` needs only g++ with 32-bit support (`g++-multilib`). It runs
+the mask, the chord and the client's real XInput wrapper bytes through the patch, with the stack
+checked on every call. CI runs it on every pull request. `sh test/build_pad_test.sh --self-test`
+builds Windows exes with stand-ins for the client, its shim and `xinput1_3.dll`. CI builds them,
+but they must run on Windows.
 
 ## Licence
 

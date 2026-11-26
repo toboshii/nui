@@ -89,6 +89,7 @@ int __cdecl l_pad_start(lua_State* L) {
 int __cdecl l_pad(lua_State* L) {
     if (!g_pbus || g_pslot < 0) { L_.pushnil(L); return 1; }
     padhook_alive(g_pbus, g_pslot);
+    padhook_pin(g_pbus);                  // route 1: pins the client's shim once it is loaded (one read until then)
     LONG idx = g_pbus->last_index;
     if (idx < 0 || idx >= PADHOOK_INDEXES) idx = 0;
     PadState s {};
@@ -154,6 +155,8 @@ int __cdecl l_pad_status(lua_State* L) {
     L_.createtable(L, 0, 16);
     int const st = padhook_state(b);
     set_str(L, "state", state_name(st));
+    // rev 3: which route is live ("wrapper": FFXiMain's XInput wrapper, "export": xinput1_3.dll's export)
+    set_str(L, "route", st != PADHOOK_LIVE ? "none" : (b->route == PADHOOK_ROUTE_WRAPPER ? "wrapper" : "export"));
     char line[256];
     padhook_describe(b, line, sizeof(line));
     set_str(L, "describe", line);
@@ -170,6 +173,8 @@ int __cdecl l_pad_status(lua_State* L) {
     set_num(L, "slot", g_pslot);
     set_num(L, "index", b->last_index);
     set_bool(L, "holding", padhook_holding(b, g_pslot));
+    set_bool(L, "shim", padhook_shim_loaded(b));      // route 1: the client has loaded xinputdll.dll
+    set_bool(L, "pinned", padhook_pin(b));            // route 1: and this module has pinned it
     LONG const i = b->last_index >= 0 && b->last_index < PADHOOK_INDEXES ? b->last_index : 0;
     set_num(L, "masked", b->masks[i].masked);
     set_num(L, "hidden", b->masks[i].hidden);

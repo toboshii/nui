@@ -67,6 +67,10 @@ packs, which 1.2.10 cannot read, under the same atlas version. An addon on each 
 one atlas, and the one that created it decided whether the other drew any window art. nui 1.4.2
 bumps the atlas to version 3.
 
+A change that alters only the art of an HD texture pack also needs a bump, for the same reason. nui
+1.5.0 bumps the atlas to version 4. Its box filter now keeps the colour of a block with no opaque
+texel, where 1.4.2 made it black. No stock pixel changes, so the golden hashes stay the same.
+
 - Textures are created on the render thread, in the managed pool.
 - Holder bits track which modules still need an entry. An entry nobody holds survives ten seconds,
   so `//lua reload youraddon` finds its own atlas still there rather than decoding it again, and
@@ -85,19 +89,63 @@ roughly 12 MiB when it holds its own.
 `Local\FFXiPadHook_v1_<pid>`, 4,096 bytes, mapped whole. Added in nui 1.3.0
 (`src/PadHook/PadHook.h`, frozen as `test/frozen/layout_padhook.1.3.0.txt`).
 
-With the client's **Enable XInput** setting on, the game reads the pad with
-`xinput1_3.dll!XInputGetState` every frame. There can only be one patch of that function, so, as with
-UiHook, there is one bus, its ABI is 1 forever, and everything after is a revision within it.
+With its **Enable XInput** setting on, the client reads the pad every frame. It does not call
+Microsoft's DLL directly. It loads its own shim, `xinputdll.dll`, from the game folder, and the shim
+calls `xinput1_3.dll`. There can only be one patch of that read, so, as with UiHook, there is one bus,
+its ABI is 1 forever, and everything after is a revision within it.
 
-- **The patch is the Windows hot-patch form.** A long jump goes into the five bytes of padding before
-  the function, where no thread runs, and then the function's first two bytes (`8B FF`,
-  `mov edi, edi`) become a short jump back to it, in one locked 16-bit write. Calling the function's
-  third byte is the original, so nothing is displaced. Anything else at the entry (another tool's hook,
-  code that is not hot-patchable) is never patched over: `pad_start()` fails without a retry and says
-  what bytes it found.
-- **nui never loads `xinput1_3.dll`.** While it is not loaded (the game reads a DirectInput pad, or has
-  not read one yet), `pad_start()` asks to be retried. Once found, it is pinned, so it can never unload
-  under the patch.
+There are two routes to the read. A module of revision 3 (nui 1.5.0) tries route 1 first. If route 1
+fails, it tries route 0. `PadBus::route` says which route is live, and `pad_status().route` reports it.
+On a bus that a revision 1 or 2 module patched, the field is zero, which is route 0.
+
+- **Route 1: the client's XInput wrapper (revision 3, nui 1.5.0).** The client keeps the shim's handle
+  in one slot and the shim's `XInputGetState_` in the next. One small wrapper in `FFXiMain.dll` reads
+  both and calls the function.
+  - nui finds the wrapper by byte signature over the client's code sections, never by address. The
+    signature also matches the SetState wrapper. The GetState wrapper is the match whose function slot
+    is 4 bytes after its handle slot. nui needs exactly one such match, both slots in a writable
+    section of `FFXiMain.dll`, and the wrapper's patch bytes on an 8-byte boundary. Once the client
+    has loaded the shim, the handle slot must hold `xinputdll.dll` and the function slot must hold its
+    `XInputGetState_`.
+  - The patch changes one instruction of the wrapper. `mov eax, [function slot]` becomes
+    `mov eax, thunk`. It has the same length, and one locked 8-byte compare-and-exchange writes it.
+  - The client writes only its slots, never its code. So the client's own rewrites of the slots (at
+    input init, on each device re-enumeration, and about every 1.5 seconds while no pad is attached)
+    never undo the patch. The thunk reads the function slot on every call, so no saved pointer can go
+    stale.
+  - The wrapper calls the shim as `__cdecl` and pops the arguments itself. The thunk therefore copies
+    the two arguments before it calls the dispatcher, which is `__stdcall` and pops the copies. The
+    dispatcher's "original" is a small `__stdcall` adapter in the same block, which calls the shim. A
+    thunk put into the slot itself would crash the game, because the arguments would be popped twice.
+    `test/pad_linux` runs that case on the client's real wrapper bytes and requires the crash.
+  - The patch goes in before the client loads the shim, and it does nothing in DirectInput mode,
+    because the wrapper returns before it reaches the patched instruction.
+  - The client's unloader frees the shim and zeros only the handle slot. nui pins `xinputdll.dll` the
+    first time `pad()` finds the handle slot set, so the unloader can never unmap it while a read is on
+    its way through the dispatcher.
+- **Route 0: the Windows hot-patch form of `xinput1_3.dll!XInputGetState`** (revisions 1 and 2, and
+  the fallback of revision 3). A long jump goes into the five bytes of padding before the function,
+  where no thread runs, and then the function's first two bytes (`8B FF`, `mov edi, edi`) become a
+  short jump back to it, in one locked 16-bit write. Calling the function's third byte is the
+  original, so nothing is displaced. Anything else at the entry (another tool's hook, code that is not
+  hot-patchable) is never patched over. Many builds of `xinput1_3.dll` start with `55 8B EC` and are
+  not hot-patchable, so route 0 refuses on those machines.
+- **When neither route works.** `pad_start()` fails, and the status names both reasons. While
+  `xinput1_3.dll` is not loaded and route 1 has failed, `pad_start()` asks to be retried. When route 0
+  refuses for good, it fails without a retry and says which bytes it found. nui never loads
+  `xinput1_3.dll` itself. On route 0 it pins the DLL once found, so it can never unload under the
+  patch.
+- **Neither patch is ever undone.** Both thunks live in one 128-byte block that no module owns and
+  nothing frees.
+- **Revisions meet on one bus.** Any revision's dispatcher works through either route's thunk and
+  calls the bus's original the same way. A revision 2 module that joins a route 1 bus registers as
+  before. A revision 2 module sets `blocked` when route 0 refuses. A revision 3 module still tries
+  route 1 then, and clears `blocked` when route 1 succeeds.
+- **To revision 3, `blocked` means only that route 0 is refused for good.** `pad_start()` stops asking
+  for a retry only when route 1 is refused for good as well: no unique wrapper, its slots outside a
+  writable section, its bytes changed by another tool, or slots that held other values on three
+  tries. A route 1 failure that can pass, such as the client writing its slots at that moment, is
+  retried.
 - **The thunk is a pass-through when nobody drives.** As UiHook: the newest revision drives, a module
   hands the dispatch on in `DllMain`, and a register replaces a driver whose module has gone.
 - **What the dispatcher does.** It calls the original, records the state per user index behind a

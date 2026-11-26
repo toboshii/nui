@@ -1988,9 +1988,11 @@ int __cdecl l_us(lua_State* L) {
     return 1;
 }
 
-// screen(w, h [, auto [, f]]) -> true | nil, why: the coordinate space Lua uses (mouse / Windower
-// pixels). With auto, the draw is scaled by render-target width / w; otherwise drawn 1:1. f (0.25-4)
-// multiplies that: one of Lua's units is f screen px (the game's UI scale, or a simulated screen).
+// screen(w, h [, auto [, f]]) -> true | nil, why: the coordinate space Lua uses. w and h are window px, the
+// size of the game window. Windower's mouse event reports UI px, which equal window px only at UI Scale 1
+// (docs/lua-api.md has the conversion). With auto, the draw is scaled by render-target width / w; otherwise
+// drawn 1:1. f (0.25-4) multiplies that: one of Lua's units is f window px (the game's UI scale, or a
+// simulated screen).
 int __cdecl l_screen(lua_State* L) {
     service_wants();
     if (g_lua.gettop(L) < 2 || g_lua.type(L, 1) != kTNumber || g_lua.type(L, 2) != kTNumber) {

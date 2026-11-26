@@ -39,7 +39,7 @@ inline int padhook_layout_text(char* out, int cap) {
 #define B(f) line("PadBus." #f, UL(offsetof(PadBus, f)))
     B(ready); B(abi_version); B(size); B(install_lock); B(hook_installed); B(owner_slot); B(in_flight); B(installs);
     B(calls); B(block); B(dispatch_ptr); B(site); B(original); B(owner_rev); B(reg_lock); B(handovers); B(blocked);
-    B(serial); B(write_lock); B(wseq); B(last_index); B(lapses); B(chord); B(reserved_hdr); B(pads); B(masks); B(clients); B(status);
+    B(serial); B(write_lock); B(wseq); B(last_index); B(lapses); B(chord); B(route); B(reserved_hdr); B(pads); B(masks); B(clients); B(status);
 #undef B
     line("sizeof(PadChord)", UL(sizeof(PadChord)));
 #define H(f) line("PadChord." #f, UL(offsetof(PadChord, f)))
@@ -52,6 +52,8 @@ inline int padhook_layout_text(char* out, int cap) {
     line("PADHOOK_BLOCKED", UL(PADHOOK_BLOCKED));
     line("PADHOOK_SRC_XINPUT", UL(PADHOOK_SRC_XINPUT));
     line("PADHOOK_SRC_DINPUT", UL(PADHOOK_SRC_DINPUT));
+    line("PADHOOK_ROUTE_EXPORT", UL(PADHOOK_ROUTE_EXPORT));
+    line("PADHOOK_ROUTE_WRAPPER", UL(PADHOOK_ROUTE_WRAPPER));
 #undef UL
     return n;
 }

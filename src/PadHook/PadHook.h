@@ -1,12 +1,65 @@
 // PadHook.h - shared hook on the controller state the game reads, for nui modules that take the pad.
 // PadHook 1: one ABI forever, revisions within it (the rules UiHook/UiHook.h keeps, applied here).
 //
-// The game reads an XInput pad with xinput1_3.dll!XInputGetState, once per frame per user index it
-// polls (with the client's own "Enable XInput" setting, padmode000 flag 6; without it the client uses
-// DirectInput8, which revision 1 does not hook: PadState::source says where a state came from, so a
-// DirectInput source can be added as another source of the same state, the same mask and the same bus).
+// With its "Enable XInput" setting on (padmode000 flag 6), the client reads an XInput pad through its own
+// shim, xinputdll.dll in the game folder, which calls xinput1_3.dll. Without that setting the client uses
+// DirectInput8, which PadHook does not hook yet. PadState::source says where a state came from, so a
+// DirectInput source can join the same state, the same mask and the same bus in a later revision.
 //
-// The patch is the Windows hot-patch form, never undone:
+// There are two routes to the state. A module tries route 1 first, then route 0. bus->route says which one
+// is live (0 also on a bus that a revision 1 or 2 module patched).
+//
+// Route 1 (revision 3): the client's XInput wrapper in FFXiMain.dll. The client keeps the shim's handle in
+// one slot (H) and the shim's XInputGetState_ in the next (F). One wrapper reads both. It is found by its
+// signature over FFXiMain's code sections, never by address (it is at 10008EA0 in the 2026-10 and 2026-11
+// builds):
+//
+//     +0   A1 <H>                  mov eax, [H]
+//          85 C0 74 1B             test eax, eax / jz fail      ; the shim is not loaded
+//     +9   A1 <F>                  mov eax, [F]                 ; the patch goes here
+//          85 C0 74 12             test eax, eax / jz fail
+//          8B 4C 24 08 8B 54 24 04 51 52        push the two arguments
+//          FF D0 83 C4 08 C2 08 00              call eax / add esp, 8 / ret 8: the shim is __cdecl
+//     fail: B8 01 00 00 00 C2 08 00              mov eax, 1 / ret 8
+//
+// The signature (these 44 bytes, H and F left out) also matches the SetState wrapper. The GetState wrapper is
+// the match where F = H + 4.
+// PadHook needs exactly one such match, both slots in a writable section of FFXiMain.dll, and wrapper + 8 on
+// an 8-byte boundary. Once the client has loaded the shim (H is not zero), H must hold xinputdll.dll's
+// handle and F must hold its XInputGetState_. While H is zero, the signature and the slot layout decide alone.
+//
+// The patch changes `mov eax, [F]` to `mov eax, thunk` (B8 <thunk>). It has the same length and stays one
+// instruction. One locked 8-byte compare-and-exchange of wrapper + 8 .. + 15 writes it, and bytes 8, 14 and
+// 15 go back unchanged. The client writes only data, so its rewrites of the slots (at input init, on each
+// device re-enumeration, and about every 1.5 s while no pad is attached) never undo the patch. Nothing is
+// saved that can go stale: the thunk and the adapter read F on every call.
+//
+//     block+16  A1 <&dispatch>   mov eax, [dispatch]
+//               85 C0 74 0B      test eax, eax / jz pass
+//               FF 74 24 08      push [esp+8]                   ; copy the two arguments
+//               FF 74 24 08      push [esp+8]
+//               FF D0 C3         call eax / ret                 ; the __stdcall dispatcher pops the copies
+//     pass:     A1 <F>           mov eax, [F]
+//               85 C0 74 02      test eax, eax / jz none
+//               FF E0            jmp eax                        ; the shim returns to the wrapper itself
+//     none:     B8 01 00 00 00   mov eax, 1                     ; what the wrapper returns without F
+//               C3               ret
+//
+//     block+64  the adapter, bus->original: __stdcall, as the dispatcher calls it
+//               A1 <F> 85 C0 74 10               mov eax, [F] / test eax, eax / jz none
+//               FF 74 24 08 FF 74 24 08          push [esp+8] twice
+//               FF D0 83 C4 08 C2 08 00          call eax / add esp, 8 / ret 8
+//     none:     B8 01 00 00 00 C2 08 00          mov eax, 1 / ret 8
+//
+// The wrapper tests F before it calls, and the patch takes that test away, so the thunk and the adapter
+// test F again. A thunk in the slot itself would crash the game: the wrapper calls F as __cdecl and pops the
+// arguments itself, so a __stdcall dispatcher reached by a jump pops them a second time (test/pad_linux runs
+// that case and requires the crash). The client's unloader frees the shim and zeros only H, and the wrapper
+// tests H before it reaches the patch. padhook_pin, which pad() calls, pins xinputdll.dll once the client has
+// loaded it, so the unloader can never unmap it while a read is on its way through the dispatcher.
+//
+// Route 0 (revisions 1 and 2, and the fallback of revision 3): the Windows hot-patch form of
+// xinput1_3.dll!XInputGetState, never undone:
 //
 //     site-5:  E9 <rel32 -> thunk>     the five bytes of padding before the function (90 or CC)
 //     site:    EB F9                   was 8B FF (mov edi, edi): a jump back into the padding
@@ -16,18 +69,19 @@
 // sees either `mov edi, edi` or the jump, never half of either. Calling site+2 is the original
 // function (mov edi, edi is a no-op), so there is no displaced code and no trampoline to build.
 //
-// The thunk lives in one VirtualAlloc block owned by no module and never freed:
-//
-//     block+0   dispatch       the driving module's dispatcher (stdcall, XInputGetState's signature), or null
 //     block+16  A1 <&dispatch> mov eax, [dispatch]
 //               85 C0          test eax, eax
 //               74 02          jz  orig
 //               FF E0          jmp eax                 ; the dispatcher returns to the game itself
 //     orig:     E9 <site+2>    jmp to the original
 //
-// eax is free at a stdcall entry, so the game's arguments and return address are untouched. With
-// dispatch == null the hook is a pass-through. xinput1_3.dll is pinned (it can then never unload
-// under the patch).
+// eax is free at a stdcall entry, so the game's arguments and return address are untouched. On this route
+// xinput1_3.dll is pinned (it can then never unload under the patch). Many builds of xinput1_3.dll are not
+// hot-patchable (they start 55 8B EC): route 0 refuses those, and says which bytes it found.
+//
+// On both routes the patch is never undone, and the thunk lives in one VirtualAlloc block (128 bytes) that
+// no module owns and nothing frees. block+0 holds the driving module's dispatcher (__stdcall, with
+// XInputGetState's signature), or null. With null, the hook passes every call through.
 //
 // What the dispatcher does (any module's: the live client with the highest revision drives, as UiHook):
 //   1. calls the original;
@@ -56,6 +110,13 @@
 // means the old behaviour. A module leaves in DllMain(DLL_PROCESS_DETACH) with
 // padhook_unregister(bus, slot, false), which hands the dispatch on before its code unmaps.
 //
+// Revisions meet on one bus. Any revision's dispatcher works through either route's thunk, and calls
+// bus->original the same way. A revision 1 or 2 module that joins a route 1 bus registers as before. A
+// revision 2 module sets bus->blocked when route 0 refuses. A revision 3 module still tries route 1 then,
+// and clears bus->blocked when route 1 succeeds. To revision 3, bus->blocked means only that route 0 is
+// refused for good: it calls the bus blocked (PADHOOK_BLOCKED) once route 1 is refused for good as well,
+// and until then a host retries.
+//
 // PADHOOK_FAULT_* and PADHOOK_TEST_* are for tests only. Never define them in a module that ships.
 
 #ifndef PADHOOK_H
@@ -69,7 +130,7 @@
 
 #define PADHOOK_ABI_VERSION 1u             // never changes again
 #ifndef PADHOOK_REV
-#define PADHOOK_REV 2                      // this file's revision within ABI 1 (tests override it); 2: the chord
+#define PADHOOK_REV 3                      // this file's revision within ABI 1 (tests override it); 2: the chord; 3: route 1
 #endif
 #define PADHOOK_MAX_CLIENTS 16
 #define PADHOOK_INDEXES 4                  // XInput user indexes 0..3
@@ -81,13 +142,21 @@
 #define PADHOOK_REPLAY_READS 2             // rev 2: a chord button tapped alone is shown to the game for this many reads
 #define PADHOOK_DRAIN_MS 100
 #ifndef PADHOOK_DLL
-#define PADHOOK_DLL "xinput1_3.dll"        // tests point it at a fake
+#define PADHOOK_DLL "xinput1_3.dll"        // route 0's DLL (tests point it at a fake)
 #endif
+#define PADHOOK_GAME "FFXiMain.dll"        // route 1: the client module that holds the wrapper and the slots
+#define PADHOOK_SHIM "xinputdll.dll"       // route 1: the client's own XInput shim
+#define PADHOOK_SHIM_GET "XInputGetState_" // ... and its GetState, __cdecl
+#define PADHOOK_WRAPPER "FFXiMain's XInput wrapper"   // route 1's name in status lines
+
+// PadBus::route (rev 3; 0 on a bus a rev 1 or 2 module patched)
+#define PADHOOK_ROUTE_EXPORT 0             // route 0: xinput1_3.dll!XInputGetState, hot-patched
+#define PADHOOK_ROUTE_WRAPPER 1            // route 1: FFXiMain's XInput wrapper
 
 // padhook_state()
-#define PADHOOK_LIVE 0                     // XInputGetState is patched by this bus
-#define PADHOOK_WAIT 1                     // not patched yet (xinput1_3.dll not loaded: the game is not using XInput yet)
-#define PADHOOK_BLOCKED 2                  // the function cannot be patched safely (not hot-patchable, another hook): never in this process
+#define PADHOOK_LIVE 0                     // one route is patched by this bus
+#define PADHOOK_WAIT 1                     // not patched yet: no wrapper, and xinput1_3.dll not loaded (yet)
+#define PADHOOK_BLOCKED 2                  // no wrapper, and route 0 cannot be patched safely (not hot-patchable, another hook)
 #define PADHOOK_NO_BUS 3
 
 #define PADHOOK_JOIN_RETRY (-1)
@@ -188,8 +257,8 @@ struct PadBus {
     volatile LONG calls;             // game reads through the dispatcher
     unsigned char* block;            // never freed
     padhook_get_fn volatile* dispatch_ptr;
-    std::uintptr_t site;             // XInputGetState
-    padhook_get_fn original;         // site + 2
+    std::uintptr_t site;             // route 0: XInputGetState; route 1: the wrapper
+    padhook_get_fn original;         // route 0: site + 2; route 1: the adapter (block + 64)
     volatile LONG owner_rev;
     volatile LONG reg_lock;
     volatile LONG handovers;
@@ -200,7 +269,8 @@ struct PadBus {
     volatile LONG last_index;        // the user index that last read connected
     volatile LONG lapses;            // captures that ended by a missed heartbeat
     PadChord chord;                  // rev 2 (zero: no chord, the rev 1 behaviour)
-    unsigned char reserved_hdr[16];
+    volatile LONG route;             // rev 3: PADHOOK_ROUTE_* (zero: route 0, the rev 2 behaviour)
+    unsigned char reserved_hdr[12];
     PadState pads[PADHOOK_INDEXES];  // 128
     PadMask masks[PADHOOK_INDEXES];  // 192
     PadClient clients[PADHOOK_MAX_CLIENTS];   // 1024
@@ -220,9 +290,16 @@ inline PadBus*& cached_bus() { static PadBus* value = nullptr; return value; }
 inline volatile LONG& module_nonce() { static volatile LONG value = 0; return value; }
 inline volatile DWORD& last_dispatch_tid() { static volatile DWORD value = 0; return value; }
 
-constexpr std::size_t kBlockBytes = 64;
-constexpr std::size_t kThunkAt = 16;
-constexpr std::size_t kThunkBytes = 5 + 2 + 2 + 2 + 5;    // 16
+constexpr std::size_t kBlockBytes = 128;                  // rev 3: 64 before, with no adapter
+constexpr std::size_t kThunkAt = 16;                      // either route's thunk
+constexpr std::size_t kThunkBytes = 5 + 2 + 2 + 2 + 5;    // 16: route 0's thunk
+constexpr std::size_t kWrapThunkBytes = 37;               // route 1's thunk
+constexpr std::size_t kAdapterAt = 64;                    // route 1's adapter (bus->original)
+constexpr std::size_t kAdapterBytes = 33;
+constexpr std::size_t kWrapSigBytes = 44;                 // through the wrapper's own fail path
+constexpr std::size_t kWrapPatchAt = 8;                   // wrapper + 8 .. + 15, written at once
+constexpr DWORD kWrapperFail = 1;                         // what the wrapper returns without H or F
+inline constexpr char kWrapChanged[] = "changed while it was patched";   // route 1 refused for good
 
 inline bool page_ok(DWORD protect, bool exec) {
     if (protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
@@ -520,6 +597,315 @@ inline void hexbytes(char* out, std::size_t n, unsigned char const* p, int count
     for (int i = 0; i < count && len + 4 < n; ++i) len += static_cast<std::size_t>(std::snprintf(out + len, n - len, "%s%02X", i ? " " : "", p[i]));
 }
 
+// ---- route 1: the client's XInput wrapper (rev 3) ----
+
+// The wrapper's first 44 bytes, through its fail path (mov eax, 1 / ret 8), so the value the thunk and the
+// adapter return without F (kWrapperFail) is the client's own. Bytes 1..4 (H) and 10..13 (F) are the slot
+// addresses, which differ by build.
+constexpr unsigned char kWrapSig[kWrapSigBytes] = {
+    0xA1, 0x00, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x1B, 0xA1, 0x00, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x12,
+    0x8B, 0x4C, 0x24, 0x08, 0x8B, 0x54, 0x24, 0x04, 0x51, 0x52, 0xFF, 0xD0, 0x83, 0xC4, 0x08, 0xC2, 0x08, 0x00,
+    0xB8, 0x01, 0x00, 0x00, 0x00, 0xC2, 0x08, 0x00,
+};
+
+inline std::uint32_t le32(unsigned char const* p) {
+    std::uint32_t v = 0;
+    std::memcpy(&v, p, 4);
+    return v;
+}
+
+inline bool wrap_sig_at(unsigned char const* p) {
+    for (std::size_t i = 0; i < kWrapSigBytes; ++i) {
+        if ((i >= 1 && i <= 4) || (i >= 10 && i <= 13)) continue;
+        if (p[i] != kWrapSig[i]) return false;
+    }
+    return true;
+}
+
+struct WrapperHit {
+    std::uintptr_t site;             // the wrapper
+    std::uintptr_t handle_slot;      // H: the shim's handle
+    std::uintptr_t fn_slot;          // F: its XInputGetState_ (H + 4)
+};
+
+// The GetState wrappers in n bytes at p, which the process sees at `base`: the signature's matches where
+// F = H + 4 (the SetState wrapper's match has F = H + 8). *first = the first one. Pure: tests call it.
+inline int scan_wrappers(unsigned char const* p, std::size_t n, std::uintptr_t base, WrapperHit* first) {
+    int count = 0;
+    for (std::size_t off = 0; off + kWrapSigBytes <= n; ++off) {
+        if (p[off] != 0xA1 || !wrap_sig_at(p + off)) continue;
+        std::uint32_t const h = le32(p + off + 1), f = le32(p + off + 10);
+#ifndef PADHOOK_FAULT_FIRST_MATCH
+        if (f != h + 4) continue;
+#endif
+        if (count == 0 && first) *first = WrapperHit {base + off, h, f};
+        ++count;
+#ifdef PADHOOK_FAULT_FIRST_MATCH
+        break;
+#endif
+    }
+    return count;
+}
+
+// What the scan's result means: null when it can be patched, otherwise why not. Pure: tests call it.
+inline char const* scan_verdict(int count, WrapperHit const& hit) {
+    if (count == 0) return "was not found (a client update?)";
+    if (count > 1) return "is not unique";
+    if ((hit.site + kWrapPatchAt) % 8 != 0) return "is not on an 8-byte boundary at +8";
+    return nullptr;
+}
+
+// Route 1's thunk (kWrapThunkBytes, at block + kThunkAt).
+inline void wrap_thunk_bytes(std::uintptr_t block, std::uintptr_t fn_slot, unsigned char* t) {
+    auto const d = static_cast<std::uint32_t>(block);
+    auto const f = static_cast<std::uint32_t>(fn_slot);
+#ifndef PADHOOK_FAULT_OLD_THUNK
+    unsigned char const code[kWrapThunkBytes] = {
+        0xA1, 0, 0, 0, 0,                // mov eax, [dispatch]
+        0x85, 0xC0, 0x74, 0x0B,          // test eax, eax / jz pass
+        0xFF, 0x74, 0x24, 0x08,          // push [esp+8]
+        0xFF, 0x74, 0x24, 0x08,          // push [esp+8]
+        0xFF, 0xD0, 0xC3,                // call eax / ret
+        0xA1, 0, 0, 0, 0,                // pass: mov eax, [F]
+        0x85, 0xC0, 0x74, 0x02,          // test eax, eax / jz none
+        0xFF, 0xE0,                      // jmp eax
+        0xB8, 0x01, 0x00, 0x00, 0x00,    // none: mov eax, 1
+        0xC3,                            // ret
+    };
+#else
+    // route 0's thunk shape on this route: the __stdcall dispatcher is reached by a jump (the crash)
+    unsigned char const code[kWrapThunkBytes] = {
+        0xA1, 0, 0, 0, 0, 0x85, 0xC0, 0x74, 0x0B, 0xFF, 0xE0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        0xA1, 0, 0, 0, 0, 0x85, 0xC0, 0x74, 0x02, 0xFF, 0xE0, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3,
+    };
+#endif
+    std::memcpy(t, code, kWrapThunkBytes);
+    std::memcpy(t + 1, &d, 4);
+    std::memcpy(t + 21, &f, 4);
+}
+
+// Route 1's adapter (kAdapterBytes, at block + kAdapterAt): the client's __cdecl F behind a __stdcall entry.
+inline void wrap_adapter_bytes(std::uintptr_t fn_slot, unsigned char* t) {
+    auto const f = static_cast<std::uint32_t>(fn_slot);
+    unsigned char const code[kAdapterBytes] = {
+        0xA1, 0, 0, 0, 0,                // mov eax, [F]
+        0x85, 0xC0, 0x74, 0x10,          // test eax, eax / jz none
+        0xFF, 0x74, 0x24, 0x08,          // push [esp+8]
+        0xFF, 0x74, 0x24, 0x08,          // push [esp+8]
+        0xFF, 0xD0,                      // call eax
+        0x83, 0xC4, 0x08,                // add esp, 8
+        0xC2, 0x08, 0x00,                // ret 8
+        0xB8, 0x01, 0x00, 0x00, 0x00,    // none: mov eax, 1
+        0xC2, 0x08, 0x00,                // ret 8
+    };
+    std::memcpy(t, code, kAdapterBytes);
+    std::memcpy(t + 1, &f, 4);
+}
+
+// The 8 bytes at wrapper + 8 before the patch, and after it.
+inline void wrap_patch_bytes(WrapperHit const& hit, std::uintptr_t thunk, unsigned char* expect, unsigned char* want) {
+    auto const f = static_cast<std::uint32_t>(hit.fn_slot);
+    auto const t = static_cast<std::uint32_t>(thunk);
+    unsigned char const before[8] = {0x1B, 0xA1, 0, 0, 0, 0, 0x85, 0xC0};     // jz's offset / mov eax, [F] / test
+    std::memcpy(expect, before, 8);
+    std::memcpy(expect + 2, &f, 4);
+    std::memcpy(want, before, 8);
+    want[1] = 0xB8;                                                          // mov eax, thunk
+    std::memcpy(want + 2, &t, 4);
+}
+
+// Patch a wrapper that the checks have passed: the block, then one locked 8-byte compare-and-exchange (as
+// UiHook's write_site). Null on success, with bus->block, dispatch_ptr, site, original and route set.
+inline char const* install_wrapper(PadBus* bus, WrapperHit const& hit) {
+    auto* block = static_cast<unsigned char*>(VirtualAlloc(nullptr, kBlockBytes, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!block) return "could not be patched (no memory for the hook block)";
+    std::memset(block, 0xCC, kBlockBytes);
+    std::memset(block, 0, 4);
+    auto const b = reinterpret_cast<std::uintptr_t>(block);
+    wrap_thunk_bytes(b, hit.fn_slot, block + kThunkAt);
+    wrap_adapter_bytes(hit.fn_slot, block + kAdapterAt);
+    FlushInstructionCache(GetCurrentProcess(), block, kBlockBytes);
+    bus->block = block;
+    bus->dispatch_ptr = reinterpret_cast<padhook_get_fn volatile*>(block);
+    bus->site = hit.site;
+    bus->original = reinterpret_cast<padhook_get_fn>(block + kAdapterAt);
+    InterlockedExchange(&bus->route, PADHOOK_ROUTE_WRAPPER);
+    MemoryBarrier();
+    auto undo = [&](char const* why) {
+        bus->block = nullptr; bus->dispatch_ptr = nullptr; bus->site = 0; bus->original = nullptr;
+        InterlockedExchange(&bus->route, PADHOOK_ROUTE_EXPORT);
+        VirtualFree(block, 0, MEM_RELEASE);
+        return why;
+    };
+    std::uintptr_t const at = hit.site + kWrapPatchAt;
+    DWORD previous = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(at), 8, PAGE_EXECUTE_READWRITE, &previous))
+        return undo("could not be patched (VirtualProtect failed)");
+    unsigned char expect[8], want[8];
+    wrap_patch_bytes(hit, b + kThunkAt, expect, want);
+    LONGLONG old_v = 0, new_v = 0;
+    std::memcpy(&old_v, expect, 8);
+    std::memcpy(&new_v, want, 8);
+    bool const wrote = InterlockedCompareExchange64(reinterpret_cast<LONGLONG volatile*>(at), new_v, old_v) == old_v;
+    VirtualProtect(reinterpret_cast<void*>(at), 8, previous, &previous);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(at), 8);
+    if (!wrote) return undo(kWrapChanged);
+    return nullptr;
+}
+
+// The wrapper's handle slot on a route 1 bus (from the patched bytes, which keep H), or 0. Checked once per
+// module: the bytes must be the patched wrapper, pointing at this bus's thunk.
+inline std::uintptr_t handle_slot(PadBus const* bus) {
+    static std::uintptr_t cached = 0;
+    if (cached) return cached;
+    if (!bus || bus->route != PADHOOK_ROUTE_WRAPPER || !bus->hook_installed || !bus->block) return 0;
+    std::uintptr_t const site = bus->site;
+    if (!span_readable(site, kWrapSigBytes)) return 0;
+    auto const* p = reinterpret_cast<unsigned char const*>(site);
+    if (p[0] != 0xA1 || p[9] != 0xB8 || le32(p + 10) != static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(bus->block) + kThunkAt))
+        return 0;
+    std::uintptr_t const slot = le32(p + 1);
+    if (!span_readable(slot, 8)) return 0;
+    cached = slot;
+    return cached;
+}
+
+inline std::uintptr_t read_slot(std::uintptr_t slot) { return *reinterpret_cast<std::uintptr_t const volatile*>(slot); }
+
+inline volatile LONG& shim_pinned() { static volatile LONG value = 0; return value; }   // one per module
+
+// fn(section) for every section of the loaded client module, or false when it is not loaded or its
+// headers are unreadable.
+template <typename Fn>
+inline bool for_each_game_section(HMODULE* out, Fn&& fn) {
+    HMODULE module = GetModuleHandleA(PADHOOK_GAME);
+    if (out) *out = module;
+    if (!module) return false;
+    auto const base = reinterpret_cast<std::uintptr_t>(module);
+    if (!span_readable(base, sizeof(IMAGE_DOS_HEADER))) return false;
+    auto const* dos = reinterpret_cast<IMAGE_DOS_HEADER const*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    std::uintptr_t const nt_at = base + static_cast<std::uintptr_t>(dos->e_lfanew);
+    if (!span_readable(nt_at, sizeof(IMAGE_NT_HEADERS32))) return false;
+    auto const* nt = reinterpret_cast<IMAGE_NT_HEADERS32 const*>(nt_at);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    auto const* section = IMAGE_FIRST_SECTION(nt);
+    if (!span_readable(reinterpret_cast<std::uintptr_t>(section), sizeof(IMAGE_SECTION_HEADER) * nt->FileHeader.NumberOfSections))
+        return false;
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section)
+        fn(base + section->VirtualAddress, base + section->VirtualAddress + section->Misc.VirtualSize, section->Characteristics);
+    return true;
+}
+
+// fn(bytes, n, address) for every run of committed readable pages in [begin, end) (a VirtualProtect inside
+// the module splits regions, so a section is never tested whole; as UiHook's scan_each)
+template <typename Fn>
+inline void for_each_readable_run(std::uintptr_t begin, std::uintptr_t end, Fn&& fn) {
+    std::uintptr_t address = begin;
+    while (address < end) {
+        MEMORY_BASIC_INFORMATION region {};
+        if (!VirtualQuery(reinterpret_cast<void const*>(address), &region, sizeof(region))) break;
+        std::uintptr_t const region_end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+        if (region_end <= address) break;
+        bool const readable = region.State == MEM_COMMIT && (page_ok(region.Protect, false) || page_ok(region.Protect, true));
+        if (!readable) { address = region_end; continue; }
+        std::uintptr_t run_end = region_end;
+        while (run_end < end) {
+            MEMORY_BASIC_INFORMATION next {};
+            if (!VirtualQuery(reinterpret_cast<void const*>(run_end), &next, sizeof(next)) || next.State != MEM_COMMIT
+                || !(page_ok(next.Protect, false) || page_ok(next.Protect, true))) break;
+            std::uintptr_t const next_end = reinterpret_cast<std::uintptr_t>(next.BaseAddress) + next.RegionSize;
+            if (next_end <= run_end) break;
+            run_end = next_end;
+        }
+        std::uintptr_t const limit = run_end < end ? run_end : end;
+        fn(reinterpret_cast<unsigned char const*>(address), static_cast<std::size_t>(limit - address), address);
+        address = run_end;
+    }
+}
+
+inline bool page_writable(DWORD protect) {
+    if (protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+    switch (protect & 0xFF) {
+    case PAGE_READWRITE: case PAGE_WRITECOPY: case PAGE_EXECUTE_READWRITE: case PAGE_EXECUTE_WRITECOPY: return true;
+    default: return false;
+    }
+}
+
+// Are both slots (H and F, 8 bytes) inside one writable section of the client module, and writable now?
+inline bool slots_writable(WrapperHit const& hit) {
+    bool ok = false;
+    for_each_game_section(nullptr, [&](std::uintptr_t begin, std::uintptr_t end, DWORD flags) {
+        if (hit.handle_slot >= begin && hit.handle_slot + 8 <= end && (flags & IMAGE_SCN_MEM_WRITE)) ok = true;
+    });
+    if (!ok) return false;
+    MEMORY_BASIC_INFORMATION region {};
+    if (!VirtualQuery(reinterpret_cast<void const*>(hit.handle_slot), &region, sizeof(region))) return false;
+    if (region.State != MEM_COMMIT || region.Type != MEM_IMAGE || !page_writable(region.Protect)) return false;
+    std::uintptr_t const low = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
+    return hit.handle_slot >= low && hit.handle_slot + 8 <= low + region.RegionSize;
+}
+
+// The scan over the client's code sections, done once per module (the client's code never changes).
+struct WrapperScan {
+    int state;                       // 0 not yet (the client module is not loaded), 1 found, 2 refused for good
+    WrapperHit hit;
+    char const* why;
+    int mismatches;                  // joins that found the slots holding other values (refused for good at 3)
+};
+inline WrapperScan& wrapper_scan() { static WrapperScan value = {0, {0, 0, 0}, nullptr, 0}; return value; }
+
+// Can route 1 still go live, as far as this module knows? False once it is refused for good.
+inline bool route1_open() { return wrapper_scan().state != 2; }
+
+inline WrapperScan& find_wrapper() {
+    WrapperScan& s = wrapper_scan();
+    if (s.state != 0) return s;
+    int count = 0;
+    WrapperHit first {0, 0, 0};
+    HMODULE game = nullptr;
+    bool const headers = for_each_game_section(&game, [&](std::uintptr_t begin, std::uintptr_t end, DWORD flags) {
+        if (!(flags & IMAGE_SCN_MEM_EXECUTE)) return;
+        for_each_readable_run(begin, end, [&](unsigned char const* p, std::size_t n, std::uintptr_t at) {
+            WrapperHit h {0, 0, 0};
+            int const c = scan_wrappers(p, n, at, &h);
+            if (c > 0 && count == 0) first = h;
+            count += c;
+        });
+    });
+    if (!game) { s.why = "was not looked for (" PADHOOK_GAME " is not loaded)"; return s; }
+    s.state = 2;
+    if (!headers) { s.why = "was not looked for (" PADHOOK_GAME "'s headers are unreadable)"; return s; }
+    s.why = scan_verdict(count, first);
+    if (!s.why && !slots_writable(first)) s.why = "has its slots outside a writable section of " PADHOOK_GAME;
+    if (!s.why) { s.hit = first; s.state = 1; }
+    return s;
+}
+
+// Once the client has loaded its shim (H is not zero): H holds xinputdll.dll's handle, and F its GetState.
+// A few tries, a ms apart: the client may be writing the slots at that moment.
+inline char const* slot_values(WrapperHit const& hit) {
+    char const* why = nullptr;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        if (attempt) Sleep(1);
+        std::uintptr_t const h = read_slot(hit.handle_slot);
+        if (h == 0) return nullptr;                  // not loaded yet: the signature and the layout decide alone
+        HMODULE shim = nullptr;
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, PADHOOK_SHIM, &shim)
+            || reinterpret_cast<std::uintptr_t>(shim) != h) {
+            why = "has a handle slot that does not hold " PADHOOK_SHIM;
+            continue;
+        }
+        auto const want = reinterpret_cast<std::uintptr_t>(reinterpret_cast<void*>(GetProcAddress(shim, PADHOOK_SHIM_GET)));
+        if (!want || read_slot(hit.fn_slot) != want) {
+            why = "has a function slot that does not hold " PADHOOK_SHIM "!" PADHOOK_SHIM_GET;
+            continue;
+        }
+        return nullptr;
+    }
+    return why;
+}
+
 }  // namespace padhook_detail
 
 // Attach to the process-wide bus, creating it on first use (leaked on purpose: it belongs to the process).
@@ -560,56 +946,57 @@ inline PadBus* padhook_attach() {
     return bus;
 }
 
+// bus->blocked means route 0 is refused for good (a rev 2 module sets it too). Rev 3 calls the bus blocked only
+// once route 1 is refused for good as well. Until then it waits, and a host retries padhook_join.
 inline int padhook_state(PadBus const* bus) {
     if (!bus) return PADHOOK_NO_BUS;
     if (bus->hook_installed) return PADHOOK_LIVE;
-    if (bus->blocked) return PADHOOK_BLOCKED;
+    if (bus->blocked && !padhook_detail::route1_open()) return PADHOOK_BLOCKED;
     return PADHOOK_WAIT;
 }
 
-// Patch XInputGetState if nobody has yet. True when the patch is live, whoever wrote it. False with
-// bus->status saying why: xinput1_3.dll not loaded yet (retry later), or a function that cannot be
-// patched safely (bus->blocked: never in this process). simulate_missing: the not-loaded path, always.
-inline bool padhook_ensure_hook(PadBus* bus, bool simulate_missing = false, char const* who = nullptr) {
-    using namespace padhook_detail;
-    if (!bus) return false;
-    if (InterlockedCompareExchange(&bus->hook_installed, 0, 0) != 0) return true;
-    if (InterlockedCompareExchange(&bus->blocked, 0, 0) != 0) return false;
-    if (simulate_missing) {
-        std::snprintf(bus->status, sizeof(bus->status), "%s is not loaded (simulated)", PADHOOK_DLL);
-        return false;
+namespace padhook_detail {
+
+// Route 1, under install_lock: null when it is live, otherwise why not.
+inline char const* try_wrapper(PadBus* bus) {
+    WrapperScan& s = find_wrapper();
+    if (s.state != 1) return s.why;
+    if (char const* why = slot_values(s.hit)) {
+        if (++s.mismatches >= 3) { s.state = 2; s.why = why; }   // seconds apart: not the client mid-write
+        return why;
     }
-    if (InterlockedCompareExchange(&bus->install_lock, 1, 0) != 0) {
-        for (int spin = 0; spin < 2000 && InterlockedCompareExchange(&bus->hook_installed, 0, 0) == 0; ++spin) Sleep(1);
-        return InterlockedCompareExchange(&bus->hook_installed, 0, 0) != 0;
-    }
-    auto fail = [&](bool block, char const* fmt, char const* a = "") {
-        std::snprintf(bus->status, sizeof(bus->status), fmt, a);
-        if (block) InterlockedExchange(&bus->blocked, 1);
-        InterlockedExchange(&bus->install_lock, 0);
-        return false;
+    char const* why = install_wrapper(bus, s.hit);
+    if (why == kWrapChanged) { s.state = 2; s.why = why; }   // another tool's patch: never again in this module
+    return why;
+}
+
+// Route 0, under install_lock: 0 live, 1 retry later, 2 never in this process; *why says why not.
+inline int try_export(PadBus* bus, char* why, std::size_t n) {
+    auto fail = [&](int verdict, char const* fmt, char const* a = "") {
+        std::snprintf(why, n, fmt, a);
+        return verdict;
     };
     // the game loads xinput1_3.dll itself when it uses XInput; nui never loads it (no XInput reads in DirectInput mode)
     HMODULE xi = nullptr;
     if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN, PADHOOK_DLL, &xi) || !xi)
-        return fail(false, "%s is not loaded (the game reads the pad with DirectInput, or not yet)", PADHOOK_DLL);
+        return fail(1, "%s is not loaded (the game reads the pad with DirectInput, or not yet)", PADHOOK_DLL);
     auto const site = reinterpret_cast<std::uintptr_t>(reinterpret_cast<void*>(GetProcAddress(xi, "XInputGetState")));
-    if (!site || !span_readable(site - 5, 7)) return fail(true, "XInputGetState not found in %s", PADHOOK_DLL);
+    if (!site || !span_readable(site - 5, 7)) return fail(2, "XInputGetState not found in %s", PADHOOK_DLL);
     auto const* p = reinterpret_cast<unsigned char const*>(site);
     bool pad_ok = true;
     for (int i = -5; i < 0; ++i) pad_ok = pad_ok && (p[i] == 0x90 || p[i] == 0xCC);
     if (p[0] == 0xEB || p[0] == 0xE9 || p[-5] == 0xE9) {
         char hex[40];
         hexbytes(hex, sizeof(hex), p - 5, 7);
-        return fail(true, "XInputGetState is already hooked by another tool (%s): not patched", hex);
+        return fail(2, "XInputGetState is already hooked by another tool (%s): not patched", hex);
     }
     if (!pad_ok || p[0] != 0x8B || p[1] != 0xFF) {
         char hex[40];
         hexbytes(hex, sizeof(hex), p - 5, 7);
-        return fail(true, "XInputGetState is not hot-patchable (%s): not patched", hex);
+        return fail(2, "XInputGetState is not hot-patchable (%s): not patched", hex);
     }
     auto* block = static_cast<unsigned char*>(VirtualAlloc(nullptr, kBlockBytes, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-    if (!block) return fail(false, "hook block alloc failed%s");
+    if (!block) return fail(1, "hook block alloc failed%s");
     std::memset(block, 0xCC, kBlockBytes);
     std::memset(block, 0, 4);
     unsigned char* t = block + kThunkAt;
@@ -619,13 +1006,14 @@ inline bool padhook_ensure_hook(PadBus* bus, bool simulate_missing = false, char
     bus->dispatch_ptr = reinterpret_cast<padhook_get_fn volatile*>(block);
     bus->site = site;
     bus->original = reinterpret_cast<padhook_get_fn>(site + 2);
+    InterlockedExchange(&bus->route, PADHOOK_ROUTE_EXPORT);
     MemoryBarrier();
 
     DWORD previous = 0;
     if (!VirtualProtect(reinterpret_cast<void*>(site - 5), 7, PAGE_EXECUTE_READWRITE, &previous)) {
         bus->block = nullptr; bus->dispatch_ptr = nullptr; bus->site = 0; bus->original = nullptr;
         VirtualFree(block, 0, MEM_RELEASE);
-        return fail(false, "VirtualProtect failed%s");
+        return fail(1, "VirtualProtect failed%s");
     }
     auto* w = reinterpret_cast<unsigned char*>(site - 5);
     std::int32_t const to_thunk = static_cast<std::int32_t>(reinterpret_cast<std::uintptr_t>(t) - site);
@@ -641,14 +1029,120 @@ inline bool padhook_ensure_hook(PadBus* bus, bool simulate_missing = false, char
     if (!wrote) {
         bus->block = nullptr; bus->dispatch_ptr = nullptr; bus->site = 0; bus->original = nullptr;
         VirtualFree(block, 0, MEM_RELEASE);
-        return fail(true, "XInputGetState changed while patching%s");
+        return fail(2, "XInputGetState changed while patching%s");
     }
-    InterlockedIncrement(&bus->installs);
-    std::snprintf(bus->status, sizeof(bus->status), "hook installed at %p by %s (rev %d)", reinterpret_cast<void*>(site),
-                  who && *who ? who : "?", PADHOOK_REV);
-    InterlockedExchange(&bus->hook_installed, 1);
-    InterlockedExchange(&bus->install_lock, 0);
+    return 0;
+}
+
+// The part of the status that names route 0's reason (rev 3 writes "<route 1's reason>; <route 0's>").
+inline char const* export_reason(char const* status) {
+    static char const prefix[] = PADHOOK_WRAPPER " ";
+    if (std::strncmp(status, prefix, sizeof(prefix) - 1) != 0) return status;
+    char const* tail = std::strstr(status, "; ");
+    return tail ? tail + 2 : "";
+}
+
+}  // namespace padhook_detail
+
+// Route 1: pin xinputdll.dll once the client has loaded it, so the client's unloader can never unmap it while
+// a read is on its way through the dispatcher. pad() calls this. Until the client loads the shim it costs one
+// read of the handle slot. True once this module has pinned it. A rev 1 or 2 module never pins it: on a bus
+// where only such modules poll, the shim stays unpinned, as it is without nui.
+inline bool padhook_pin(PadBus const* bus) {
+    using namespace padhook_detail;
+    volatile LONG& pinned = shim_pinned();
+    if (pinned) return true;
+    std::uintptr_t const slot = handle_slot(bus);
+    if (!slot) return false;
+    // a handle that was not the shim (the client between FreeLibrary and zeroing H, or something else): asked
+    // about again at most once a second
+    static std::uintptr_t refused = 0;
+    static DWORD refused_at = 0;
+    std::uintptr_t const h = read_slot(slot);
+    if (h == 0 || (h == refused && GetTickCount() - refused_at < 1000)) return false;
+    HMODULE shim = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, PADHOOK_SHIM, &shim)
+        || reinterpret_cast<std::uintptr_t>(shim) != h) {
+        refused = h;
+        refused_at = GetTickCount();
+        return false;
+    }
+    HMODULE held = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN, PADHOOK_SHIM, &held) || held != shim) return false;
+    InterlockedExchange(&pinned, 1);
     return true;
+}
+
+// Is the client's shim loaded now (route 1: the handle slot is not zero)? False on route 0.
+inline bool padhook_shim_loaded(PadBus const* bus) {
+    std::uintptr_t const slot = padhook_detail::handle_slot(bus);
+    return slot && padhook_detail::read_slot(slot) != 0;
+}
+
+// Patch one route if nobody has yet: route 1, the client's XInput wrapper, then route 0, the export. True when
+// a patch is live, whoever wrote it. False with bus->status naming both routes' reasons: retry later
+// (PADHOOK_WAIT), or never in this process (bus->blocked). A rev 2 module may have set bus->blocked: route 1 is
+// still tried then, and clears it. simulate_missing: both not-found paths, always.
+inline bool padhook_ensure_hook(PadBus* bus, bool simulate_missing = false, char const* who = nullptr) {
+    using namespace padhook_detail;
+    if (!bus) return false;
+    if (InterlockedCompareExchange(&bus->hook_installed, 0, 0) != 0) return true;
+    if (simulate_missing) {
+        if (InterlockedCompareExchange(&bus->blocked, 0, 0) == 0)   // a blocked bus keeps route 0's real reason
+            std::snprintf(bus->status, sizeof(bus->status), "%s was not found (simulated); %s is not loaded (simulated)",
+                          PADHOOK_WRAPPER, PADHOOK_DLL);
+        return false;
+    }
+    if (InterlockedCompareExchange(&bus->install_lock, 1, 0) != 0) {
+        for (int spin = 0; spin < 2000 && InterlockedCompareExchange(&bus->hook_installed, 0, 0) == 0; ++spin) Sleep(1);
+        return InterlockedCompareExchange(&bus->hook_installed, 0, 0) != 0;
+    }
+    auto done = [&](bool live) {
+        if (live) {
+            InterlockedIncrement(&bus->installs);
+            InterlockedExchange(&bus->hook_installed, 1);
+        }
+        InterlockedExchange(&bus->install_lock, 0);
+        return live;
+    };
+    if (InterlockedCompareExchange(&bus->hook_installed, 0, 0) != 0) {   // patched between the first check and the lock
+        InterlockedExchange(&bus->install_lock, 0);
+        return true;
+    }
+    char const* const who_s = who && *who ? who : "?";
+#ifdef PADHOOK_FAULT_EXPORT_FIRST
+    {
+        char why0[176];
+        if (!InterlockedCompareExchange(&bus->blocked, 0, 0) && try_export(bus, why0, sizeof(why0)) == 0) {
+            std::snprintf(bus->status, sizeof(bus->status), "hook installed at %s!XInputGetState", PADHOOK_DLL);
+            return done(true);
+        }
+    }
+#endif
+    char const* const why_wrapper = try_wrapper(bus);
+    if (!why_wrapper) {
+        std::snprintf(bus->status, sizeof(bus->status), "hook installed at %s %08lX by %s (rev %d)", PADHOOK_WRAPPER,
+                      static_cast<unsigned long>(bus->site), who_s, PADHOOK_REV);
+        InterlockedExchange(&bus->blocked, 0);
+        done(true);
+        padhook_pin(bus);
+        return true;
+    }
+    char why_export[176];
+    int verdict = 2;
+    if (InterlockedCompareExchange(&bus->blocked, 0, 0) != 0) {
+        std::snprintf(why_export, sizeof(why_export), "%s", export_reason(bus->status));   // refused before: never again
+    } else {
+        verdict = try_export(bus, why_export, sizeof(why_export));
+    }
+    if (verdict == 0) {
+        std::snprintf(bus->status, sizeof(bus->status), "hook installed at %s!XInputGetState %08lX by %s (rev %d); %s %s",
+                      PADHOOK_DLL, static_cast<unsigned long>(bus->site), who_s, PADHOOK_REV, PADHOOK_WRAPPER, why_wrapper);
+        return done(true);
+    }
+    std::snprintf(bus->status, sizeof(bus->status), "%s %s; %s", PADHOOK_WRAPPER, why_wrapper, why_export);
+    if (verdict == 2) InterlockedExchange(&bus->blocked, 1);
+    return done(false);
 }
 
 // A slot index, or -1. The dispatch goes to this module when nobody drives it, when its revision is
@@ -782,7 +1276,11 @@ inline int padhook_active_clients(PadBus const* bus) {
     return n;
 }
 
-// One line for a status display: "live at 6C1A2B30; 2 clients: chronicle r1 (drives, holds), hud r1"
+// One line for a status display, e.g.
+//   "live at FFXiMain's XInput wrapper 10008EA0; 1 client: chronicle r3 (drives)"
+//   "live at FFXiMain's XInput wrapper 10008EA0 (the client has not loaded xinputdll.dll yet); 1 client: ..."
+//   "live at xinput1_3.dll!XInputGetState 6C1A2B30; 2 clients: chronicle r3 (drives, holds), hud r2"
+//   "blocked: FFXiMain's XInput wrapper was not found (a client update?); XInputGetState is not hot-patchable (...)"
 inline void padhook_describe(PadBus const* bus, char* out, std::size_t n) {
     if (!out || n == 0) return;
     out[0] = 0;
@@ -792,8 +1290,16 @@ inline void padhook_describe(PadBus const* bus, char* out, std::size_t n) {
         std::snprintf(out, n, "%s: %s", st == PADHOOK_BLOCKED ? "blocked" : "waiting", bus->status);
         return;
     }
-    std::size_t len = static_cast<std::size_t>(std::snprintf(out, n, "live at %08lX; %d clients",
-        static_cast<unsigned long>(bus->site), padhook_active_clients(bus)));
+    int const clients = padhook_active_clients(bus);
+    std::size_t len = 0;
+    if (bus->route == PADHOOK_ROUTE_WRAPPER) {
+        len = static_cast<std::size_t>(std::snprintf(out, n, "live at %s %08lX%s; %d client%s", PADHOOK_WRAPPER,
+            static_cast<unsigned long>(bus->site), padhook_shim_loaded(bus) ? "" : " (the client has not loaded " PADHOOK_SHIM " yet)",
+            clients, clients == 1 ? "" : "s"));
+    } else {
+        len = static_cast<std::size_t>(std::snprintf(out, n, "live at %s!XInputGetState %08lX; %d client%s", PADHOOK_DLL,
+            static_cast<unsigned long>(bus->site), clients, clients == 1 ? "" : "s"));
+    }
     char const* sep = ": ";
     for (int i = 0; i < PADHOOK_MAX_CLIENTS && len < n; ++i) {
         PadClient const& c = bus->clients[i];
@@ -801,8 +1307,9 @@ inline void padhook_describe(PadBus const* bus, char* out, std::size_t n) {
         char nm[17];
         std::memcpy(nm, c.name, 16);
         nm[16] = 0;
-        len += static_cast<std::size_t>(std::snprintf(out + len, n - len, "%s%s r%lu%s%s", sep, nm[0] ? nm : "?",
-            static_cast<unsigned long>(c.rev), bus->owner_slot == i ? " (drives)" : "", c.capture ? " (holds)" : ""));
+        bool const drives = bus->owner_slot == i, holds = c.capture != 0;
+        len += static_cast<std::size_t>(std::snprintf(out + len, n - len, "%s%s r%lu%s", sep, nm[0] ? nm : "?",
+            static_cast<unsigned long>(c.rev), drives && holds ? " (drives, holds)" : drives ? " (drives)" : holds ? " (holds)" : ""));
         sep = ", ";
     }
 }

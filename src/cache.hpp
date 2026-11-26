@@ -29,8 +29,9 @@ namespace nui {
 
 // atlas 2 (1.2.3): + 'menu    menu2fon'. atlas 3 (1.4.2): an HD texture pack's art, boxed down to the
 // game's size. 1.4.1 read it under atlas 2, where 1.2.10 cannot read it, so the first module to create the
-// entry decided whether the other one drew any window art.
-constexpr std::uint32_t kFmtAtlas = 3, kFmtIcon = 1, kFmtPicture = 1;
+// entry decided whether the other one drew any window art. atlas 4 (1.5.0): a block of an HD texture with no
+// opaque texel keeps its colour when it is boxed down (1.4.2 made it black). No stock pixel changes.
+constexpr std::uint32_t kFmtAtlas = 4, kFmtIcon = 1, kFmtPicture = 1;
 
 inline NcKey atlas_key(int window_type, std::uint64_t install) {
     return NcKey {NC_ATLAS, kFmtAtlas, std::uint32_t(window_type), 0, install};
