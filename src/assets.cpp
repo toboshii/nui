@@ -277,12 +277,15 @@ int tex_scale(TexInfo const& t, int want_w, int rows) {
 }
 
 // An image s times the size wanted, boxed down to it: each texel the average of its s x s block, the
-// colour weighted by alpha so a clear texel's colour does not darken an opaque edge next to it.
+// colour weighted by alpha so a clear texel's colour does not darken an opaque edge next to it. A block
+// with no opaque texel at all keeps its plain average colour: the stock decode keeps a clear texel's
+// colour too, and linear filtering samples it at an edge (test/hd_linux: an enlarged texture boxes down
+// to the stock texels exactly).
 void box_down(std::vector<uint32_t> const& src, int sw, int s, uint32_t* dst, int w, int rows, int stride) {
     unsigned const n = unsigned(s) * unsigned(s);
     for (int y = 0; y < rows; ++y)
         for (int x = 0; x < w; ++x) {
-            uint64_t sa = 0, sr = 0, sg = 0, sb = 0;
+            uint64_t sa = 0, sr = 0, sg = 0, sb = 0, pr = 0, pg = 0, pb = 0;
             for (int j = 0; j < s; ++j) {
                 uint32_t const* row = &src[size_t(y * s + j) * size_t(sw) + size_t(x) * size_t(s)];
                 for (int i = 0; i < s; ++i) {
@@ -292,14 +295,21 @@ void box_down(std::vector<uint32_t> const& src, int sw, int s, uint32_t* dst, in
                     sr += uint64_t((p >> 16) & 0xFF) * a;
                     sg += uint64_t((p >> 8) & 0xFF) * a;
                     sb += uint64_t(p & 0xFF) * a;
+                    pr += (p >> 16) & 0xFF;
+                    pg += (p >> 8) & 0xFF;
+                    pb += p & 0xFF;
                 }
             }
             uint32_t const a = uint32_t((sa + n / 2) / n);
-            uint32_t r = 0, g = 0, b = 0;
+            uint32_t r, g, b;
             if (sa) {
                 r = uint32_t((sr + sa / 2) / sa);
                 g = uint32_t((sg + sa / 2) / sa);
                 b = uint32_t((sb + sa / 2) / sa);
+            } else {
+                r = uint32_t((pr + n / 2) / n);
+                g = uint32_t((pg + n / 2) / n);
+                b = uint32_t((pb + n / 2) / n);
             }
             dst[size_t(y) * size_t(stride) + size_t(x)] = (a << 24) | (r << 16) | (g << 8) | b;
         }
