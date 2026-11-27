@@ -444,7 +444,7 @@ int run_wrapper() {
     check("client setup", game_setup() == 1);
     game_point(1);
     check("slots mismatch: retry", padhook_join(bus, "test") == PADHOOK_JOIN_RETRY, bus->status);
-    check("slots mismatch: says so", has(bus->status, "function slot does not hold"), bus->status);
+    check("slots mismatch: says so", has(bus->status, "function slot that does not hold"), bus->status);
     check("slots mismatch: not patched", wrapper[9] == 0xA1);
     game_point(0);
     game_unload();
