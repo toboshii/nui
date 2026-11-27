@@ -2,8 +2,9 @@
 
 Addons that use nui each compile their own copy of it, which means several copies of the library
 can be alive in one game process at once, at different versions, loading and unloading in any
-order. Three things cannot be done per copy: patching the client's renderer, holding a texture, and
-patching the controller read. Those go through named shared memory, and their layouts are frozen.
+order. Four things cannot be done per copy: patching the client's renderer, holding a texture,
+patching the controller read, and patching the keyboard reads. Those go through named shared memory,
+and their layouts are frozen.
 
 Frozen means the offsets never move. New fields are only ever appended into reserved space with a
 revision number, and zero always means "the old behaviour", because the mapping starts zeroed. A
@@ -169,3 +170,54 @@ On a bus that a revision 1 or 2 module patched, the field is zero, which is rout
 - **Designed for a second source.** `PadState::source` says where a state came from (`xinput`, and
   `dinput` reserved), and the mask works on one button word in XInput's layout with the triggers as
   two more bits. A DirectInput hook in a later revision adds a source, not a new contract.
+
+## KeyHook 1
+
+`Local\FFXiKeyHook_v1_<pid>`, 4,096 bytes, mapped whole. Added in nui 1.6.0
+(`src/KeyHook/KeyHook.h`, frozen as `test/frozen/layout_keyhook.1.6.0.txt`).
+
+The client reads the DirectInput keyboard in one function, once per main loop tick on its main
+thread. It calls `GetDeviceState` for the 256-byte key state, then `GetDeviceData` for up to 16
+buffered events. A key counts as down when its state byte says so, or when a press event for it came
+in that tick. The client ignores release events.
+
+There can only be one patch of those reads, so, as with UiHook and PadHook, there is one bus, its ABI
+is 1 forever, and everything after is a revision within it.
+
+- **The sites.** The instruction after each read is `cmp eax, 0x800700AA`. nui finds each read by a
+  signature that runs from the load of the device to that `cmp` (45 and 42 bytes). It needs:
+  - exactly one match of each in the client's code
+  - both reads to load the device from the same place
+  - the event read within 1 KB after the state read
+  - each `cmp` inside one aligned 8-byte block
+
+  Otherwise it patches nothing, for good in this process, and `key_start()` says why.
+- **The patch** changes each `cmp` into a call of the same length to a thunk. One locked 8-byte
+  compare-and-exchange writes it. A thread inside the read returns to a whole instruction either way.
+  The thunk runs after the read. It passes the read's result, its buffer, the count and the device to
+  the dispatcher. Then it runs the client's own `cmp` on the client's own `eax`, and returns with the
+  flags that the `cmp` set. There is nothing to chain, because the read has already run.
+- **Windower's wrapper.** With Windower loaded, the device the client reads is Windower's keyboard
+  wrapper, which applies its own block, console key and binds first. The hook runs after it, so
+  Windower's events and binds see every key.
+- **Neither patch is ever undone.** Both thunks live in one 128-byte block that no module owns and
+  nothing frees. With nobody driving, a thunk runs the client's `cmp` and nothing else.
+- **The thunks call the dispatcher with one frozen signature**, `keyhook_fn(kind, hr, data, count,
+  asked, device)`. The newest revision drives, a module hands the dispatch on in `DllMain`, and a
+  register replaces a driver whose module has gone, as with UiHook. A dispatcher ignores a `kind` it
+  does not know.
+- **What the dispatcher does.** It hides the union of the live clients' key masks (256 bits each). It
+  keeps one record per key for both reads: the game saw this press, or this press is hidden.
+  - The dispatcher decides a new press once, at the first read that shows it.
+  - A press the game saw stays the game's until its release.
+  - A hidden press stays hidden until its release, even after its key leaves every mask.
+  - The state read clears a hidden key's byte. The event read drops a hidden key's events, moves the
+    rest down and writes the new count.
+  - A press ends at its release event. If that event is lost, the press ends once the state shows the
+    key up and the event read returned fewer events than the client asked for.
+- **A mask needs a heartbeat.** A client that did not renew its mask in the last 250 ms hides
+  nothing new. An addon that errors or stops can never leave the player without keys. A press that
+  is already hidden still waits for its release.
+- **What it does not see.** The chat line reads Space, `/` and typed characters from window messages,
+  not from DirectInput.
+

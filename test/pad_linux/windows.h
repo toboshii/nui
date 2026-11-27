@@ -37,6 +37,7 @@ extern DWORD g_fake_tick;
 inline DWORD GetTickCount() { return g_fake_tick; }
 SIZE_T VirtualQuery(LPCVOID, MEMORY_BASIC_INFORMATION*, SIZE_T); BOOL GetModuleHandleExA(DWORD, LPCSTR, HMODULE*);
 HMODULE GetModuleHandleA(LPCSTR);
+DWORD GetModuleFileNameA(HMODULE, char*, DWORD);
 void* GetProcAddress(HMODULE, LPCSTR); void* VirtualAlloc(void*, SIZE_T, DWORD, DWORD); BOOL VirtualFree(void*, SIZE_T, DWORD);
 BOOL VirtualProtect(void*, SIZE_T, DWORD, DWORD*); BOOL FlushInstructionCache(HANDLE, LPCVOID, SIZE_T); HANDLE GetCurrentProcess();
 HANDLE CreateFileMappingA(HANDLE, void*, DWORD, DWORD, DWORD, LPCSTR); void* MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, SIZE_T);

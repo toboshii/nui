@@ -34,6 +34,12 @@ jobs:
       - name: The controller hook's Windows tests build (they run on Windows)
         run: NUI_NORUN=1 sh test/build_pad_test.sh
 
+      - name: The keyboard hook on the client's real read bytes
+        run: sh test/key_linux/run.sh --self-test
+
+      - name: The keyboard hook's Windows tests build (they run on Windows)
+        run: NUI_NORUN=1 sh test/build_key_test.sh
+
       - name: Frozen shared-memory layouts
         run: python3 test/frozen_check.py
 

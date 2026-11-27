@@ -204,6 +204,55 @@ route, for example `live at FFXiMain's XInput wrapper 10008EA0; 1 client: chroni
 
 Give the pad back and leave the hook. `stop()` and unloading do this too.
 
+## The keyboard (1.6.0)
+
+nui can keep single keys from the game. Windower's `keyboard` event cannot do that: a `true` return
+leaves the key with the game. `keyboard_blockinput` blocks every key, so the player cannot chat, use a
+macro or run a Windower bind meanwhile. nui patches the client's two keyboard reads once per
+process, shared by every nui module (KeyHook 1, see [abi.md](abi.md#keyhook-1)). The keys you name
+are hidden from the game's actions: the camera, the menus, the action bindings, and Enter and Escape
+in the chat line.
+
+What the hook does not see: the chat line's own keys. Space, `/` and typed characters reach the chat
+line as window messages, so a key you hide can still open the chat line or type into it. While the
+player types into your addon, use `keyboard_blockinput` to keep the text from the game.
+
+Windower reads the keyboard before nui does. Its `keyboard` event, its binds and its console see every
+key, hidden or not.
+
+### `key_start([flags]) -> ok, msg [, retry_ms]`
+
+Join the key hook, and patch the client's keyboard reads if no module has. `retry_ms` means try again
+later (`FFXiMain.dll` is not loaded yet, which never happens in game). No `retry_ms` means never in this
+process: the reads were not found, are not unique, or do not have the expected shape. Keep keys from
+the game some other way then. `msg` gives the reason. `flags` may contain `nosig`, which always takes
+the not-found path (the fail-closed test).
+
+### `key_hide(code, ...)`
+
+The DirectInput key codes (0 to 255) to hide from the game, one argument each. To pass a list, call
+`key_hide(unpack(t))`. With no codes, nothing is hidden. Each call replaces the list before it, and
+each call is also its heartbeat. The list lapses by itself 250 ms after the last call, so call it
+every frame while it holds keys, from `prerender`.
+
+The hook decides each press when the game first reads it: hidden if its key is in the list then. A
+hidden press stays hidden until its release, even after the key leaves the list or the list lapses. A
+press the game saw stays the game's until its release, even if the key goes into the list meanwhile.
+So the game never sees half a press. The hook decides a tap shorter than a frame the same way.
+
+### `key_status() -> table`
+
+`state` (`live`, `waiting`, `blocked`, `no bus`), `describe` (one line), `joined`, `hiding` (this
+module's list holds keys), `keys` (how many), `held_hidden` (presses hidden now, until their release),
+`reads`, `events`, `hidden`, `dropped`, `ended`, `lapses`, `calls`, `clients`, `rev`, `owner_rev`,
+`site_state`, `site_events`, and `device`: the module that owns the keyboard device the game reads
+(`Hook.dll` for Windower's wrapper). `describe` reads, for example, `live at FFXiMain's keyboard
+reads 10005A89, 10005B20; 1 client: chronicle r1 (drives, hides 10)`.
+
+### `key_stop()`
+
+Give the keys back and leave the hook. `stop()` and unloading do this too.
+
 ## Diagnostics
 
 ### `status() -> table`

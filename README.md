@@ -442,6 +442,7 @@ The Lua module table is documented in [docs/lua-api.md](docs/lua-api.md), the dr
 | `wintype(n)` / `wtread()` | the window style, 1 to 8 |
 | `status()` / `prof()` / `us()` | state, counters, a microsecond clock |
 | `pad_start()` / `pad()` / `pad_capture(on)` | the controller: read it, hold it (1.3.0) |
+| `key_start()` / `key_hide(code, ...)` | keep single keys from the game (1.6.0) |
 
 A DLL can add native functions of its own to that table: `host_open` takes an array of
 `{name, lua_CFunction}` and appends them. See
@@ -455,6 +456,13 @@ hook. Since 1.5.0 it patches the client's own XInput wrapper in `FFXiMain.dll`, 
 build of `xinput1_3.dll`. Where that wrapper is not found, it falls back to a hot patch of
 `xinput1_3.dll!XInputGetState`. See [docs/lua-api.md](docs/lua-api.md#the-controller-130) and
 [docs/abi.md](docs/abi.md#padhook-1).
+
+The **keyboard** (1.6.0) is the other input nui takes. Windower's `keyboard` event sees every key but
+cannot keep one from the game, and `keyboard_blockinput` keeps all of them. `key_hide(...)` hides only
+the keys an addon names, from the game's actions alone, so the player can still chat, use macros and
+run Windower binds. It patches the client's two keyboard reads in `FFXiMain.dll`, after Windower has
+seen them. The chat line reads typed text from window messages, which this hook does not see. See
+[docs/lua-api.md](docs/lua-api.md#the-keyboard-160) and [docs/abi.md](docs/abi.md#keyhook-1).
 
 ## Drawing offline
 
@@ -526,6 +534,11 @@ the mask, the chord and the client's real XInput wrapper bytes through the patch
 checked on every call. CI runs it on every pull request. `sh test/build_pad_test.sh --self-test`
 builds Windows exes with stand-ins for the client, its shim and `xinput1_3.dll`. CI builds them,
 but they must run on Windows.
+
+The keyboard hook has two as well. `sh test/key_linux/run.sh --self-test` runs the press rules. It
+also runs the client's real keyboard read bytes through the patch, and it checks the stack, the
+registers and the client's own flags on every call. `sh test/build_key_test.sh --self-test` builds Windows exes
+with a stand-in client and a second module. CI runs the first and builds the second.
 
 ## Licence
 

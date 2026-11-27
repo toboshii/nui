@@ -12,6 +12,7 @@
 #include "d3d8_backend.hpp"
 #include "device.hpp"
 #include "ops.hpp"
+#include "key.hpp"
 #include "pad.hpp"
 #include "textures.hpp"
 #include "ui.hpp"
@@ -1213,6 +1214,7 @@ int __cdecl l_stop(lua_State* L) {
     bool const handed = render_final_pass();   // 1.2.5: textures given back on the render thread (REND-5)
     g_running = false;
     pad_release();                        // 1.3.0: the pad goes back to the game with the drawing
+    key_release();                        // 1.6.0: and the keys
     if (g_bus && g_slot >= 0) uihook_unregister(g_bus, g_slot, true);
     g_slot = -1;
     // 1.2.1: no decode is wanted any more; the one in progress (at most one picture) is waited for
@@ -2057,6 +2059,7 @@ int host_open(lua_State* L, HostConfig const& cfg, HostFn const* extra, int n_ex
     if (!bind_lua()) return 0;
     g_cfg = &cfg;
     pad_set_name(cfg.name);
+    key_set_name(cfg.name);
     if (!g_lock_ready) {
         InitializeCriticalSection(&g_lock);
         InitializeCriticalSection(&g_plock);
@@ -2069,7 +2072,7 @@ int host_open(lua_State* L, HostConfig const& cfg, HostFn const* extra, int n_ex
         g_qpc0 = qpc();
         g_pw.t0 = g_qpc0;
     }
-    g_lua.createtable(L, 0, 28 + (n_extra > 0 ? n_extra : 0));
+    g_lua.createtable(L, 0, 32 + (n_extra > 0 ? n_extra : 0));
     static HostFn const fns[] = {{"version", guarded<l_version>}, {"start", guarded<l_start>}, {"stop", guarded<l_stop>},
                                  {"status", guarded<l_status>}, {"screen", guarded<l_screen>}, {"layer", guarded<l_layer>},
                                  {"layer_pos", guarded<l_layer_pos>}, {"tex_load", guarded<l_tex_load>},
@@ -2082,7 +2085,10 @@ int host_open(lua_State* L, HostConfig const& cfg, HostFn const* extra, int n_ex
                                  {"pad_start", guarded<l_pad_start>}, {"pad", guarded<l_pad>},
                                  {"pad_capture", guarded<l_pad_capture>}, {"pad_chord", guarded<l_pad_chord>},
                                  {"pad_config", guarded<l_pad_config>},
-                                 {"pad_status", guarded<l_pad_status>}, {"pad_stop", guarded<l_pad_stop>}};
+                                 {"pad_status", guarded<l_pad_status>}, {"pad_stop", guarded<l_pad_stop>},
+                                 // 1.6.0: keys hidden from the game alone (key.hpp)
+                                 {"key_start", guarded<l_key_start>}, {"key_hide", guarded<l_key_hide>},
+                                 {"key_status", guarded<l_key_status>}, {"key_stop", guarded<l_key_stop>}};
     for (HostFn const& fn : fns) {
         g_lua.pushcclosure(L, fn.f, 0);
         g_lua.setfield(L, -2, fn.name);
@@ -2105,6 +2111,7 @@ void host_detach() {
     uihook_unregister(g_bus, g_slot, false);
     g_slot = -1;
     pad_detach();      // 1.3.0: the pad hook's dispatch handed on before this code unmaps
+    key_detach();      // 1.6.0: and the key hook's
     nc_detach();       // holder bits and the cache client slot, lock-free; textures stay for a sweep
 }
 

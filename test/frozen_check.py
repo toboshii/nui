@@ -20,7 +20,8 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAIRS = [('uihook', 'frozen/layout_uihook.1.0.0.txt', 'layout_uihook.txt'),
          ('nuicache', 'frozen/layout_nuicache.1.0.0.txt', 'layout_nuicache.txt'),
-         ('padhook', 'frozen/layout_padhook.1.3.0.txt', 'layout_padhook.txt')]   # PadHook 1, frozen at 1.3.0
+         ('padhook', 'frozen/layout_padhook.1.3.0.txt', 'layout_padhook.txt'),   # PadHook 1, frozen at 1.3.0
+         ('keyhook', 'frozen/layout_keyhook.1.6.0.txt', 'layout_keyhook.txt')]   # KeyHook 1, frozen at 1.6.0
 
 
 def frozen_lines(path):
