@@ -188,8 +188,14 @@ int run_main(char const* layout) {
     check("KEY-2: Up hidden from the state and the events", !game_down(s, UP), "");
     check("KEY-2: W the game's", st(s, W) && ev_of(s, W) == 1);
     check("KEY-2: the dispatcher saw the client's device", bus->keys.device == &g_dev && bus->calls >= 2);
-    char dev[64];
-    check("STATUS: the device's module is this exe", keyhook_device_module(bus, dev, sizeof(dev)) && has(dev, "key_test"), dev);
+    // the stand-in device's vtable is in this exe, whatever its file is called (the self-test's fault builds have
+    // another name)
+    char dev[64], self[260];
+    DWORD const len = GetModuleFileNameA(nullptr, self, sizeof(self));
+    char const* exe_name = self;
+    for (DWORD i = 0; i < len; ++i) if (self[i] == '\\' || self[i] == '/') exe_name = self + i + 1;
+    check("STATUS: the device's module is this exe", len > 0 && keyhook_device_module(bus, dev, sizeof(dev))
+        && _stricmp(dev, exe_name) == 0, dev);
     hide(bus, a, {});
     s = tick();
     check("KEY-4: out of the mask, still held: still hidden", !st(s, UP));
