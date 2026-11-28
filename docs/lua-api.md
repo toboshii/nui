@@ -270,7 +270,8 @@ The table has these fields:
 - `moves`: the movement entries the client reads, as `key | rule << 8 | context << 16`. The rule is 0
   for none, 1 Ctrl, 2 Alt, 4 Shift, 8 not Shift and 7 any. A rule 0 key also acts with Ctrl or Alt
   held, unless it is a shortcut key.
-- `mode`: the keyboard mode, 0 to 2. The movement keys act only in modes 1 and 2. Absent while unknown.
+- `mode`: the keyboard mode, the game's "Keyboard size" (Config, Misc. 2): 0 Full, 1 Compact 1, 2 Compact 2. The
+  movement keys act only in the two compact sizes. Absent while unknown.
 - `layout`: the keyboard layout. Layouts 2 and 3 move some keys. Absent while unknown.
 
 Without the tables it returns `nil` and the reason: the client is not loaded, or a signature was not
