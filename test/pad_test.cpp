@@ -52,6 +52,13 @@ set_fn g_set = nullptr;
 
 constexpr unsigned A = 0x1000, B = 0x2000, X = 0x4000, Y = 0x8000, START = 0x0010;
 
+// the describe line's client part for this module ("1 client: test r4 (drives)"): it names the revision the test is built at
+char const* drives_text() {
+    static char text[48];
+    std::snprintf(text, sizeof(text), "1 client: test r%d (drives)", PADHOOK_REV);
+    return text;
+}
+
 PadXState read(DWORD index = 0, DWORD* r = nullptr) {
     PadXState s {};
     DWORD const rr = g_game_read ? g_game_read(index, &s) : g_get(index, &s);
@@ -282,7 +289,7 @@ int run_main(char const* layout_path) {
     check("status: route 0 by name", has(bus->status, "!XInputGetState") && has(bus->status, "(rev 4)"), bus->status);
     char line[256];
     padhook_describe(bus, line, sizeof(line));
-    check("describe: route 0", has(line, "live at " PADHOOK_DLL "!XInputGetState") && has(line, "1 client: test r3 (drives)"), line);
+    check("describe: route 0", has(line, "live at " PADHOOK_DLL "!XInputGetState") && has(line, drives_text()), line);
     check("pin: nothing to pin on route 0", !padhook_pin(bus) && !padhook_shim_loaded(bus));
 
     shared_checks(bus, slot);
@@ -476,7 +483,7 @@ int run_wrapper() {
     check("the shim is the handle", reinterpret_cast<DWORD>(shim) == slots[0]);
     check("pin", padhook_pin(bus) && padhook_shim_loaded(bus));
     padhook_describe(bus, line, sizeof(line));
-    check("describe: loaded", has(line, "live at FFXiMain's XInput wrapper") && !has(line, "not loaded") && has(line, "1 client: test r3 (drives)"),
+    check("describe: loaded", has(line, "live at FFXiMain's XInput wrapper") && !has(line, "not loaded") && has(line, drives_text()),
           line);
 
     shared_checks(bus, slot);
