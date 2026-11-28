@@ -538,6 +538,11 @@ also runs the client's real keyboard read bytes through the patch, and it checks
 registers and the client's own flags on every call. `sh test/build_key_test.sh --self-test` builds Windows exes
 with a stand-in client and a second module. CI runs the first and builds the second.
 
+The bindings read has two too. `sh test/binds_linux/run.sh --self-test` runs the signatures over the
+client's real bytes and every refusal. Given a saved image of the client (an argument, or `NUI_FFXI_IMAGE`),
+it also scans the whole image. `sh test/build_binds_test.sh --self-test` builds a Windows exe with a
+stand-in client. CI runs the first and builds the second.
+
 ## Licence
 
 BSD 3-Clause. See [LICENSE](LICENSE).
