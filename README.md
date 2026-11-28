@@ -443,6 +443,7 @@ The Lua module table is documented in [docs/lua-api.md](docs/lua-api.md), the dr
 | `status()` / `prof()` / `us()` | state, counters, a microsecond clock |
 | `pad_start()` / `pad()` / `pad_capture(on)` | the controller: read it, hold it |
 | `key_start()` / `key_hide(code, ...)` | keep single keys from the game |
+| `key_bindings()` | the client's keyboard bindings, read only |
 
 A DLL can add native functions of its own to that table: `host_open` takes an array of
 `{name, lua_CFunction}` and appends them. See
@@ -463,6 +464,8 @@ the keys an addon names, from the game's actions alone, so the player can still 
 run Windower binds. It patches the client's two keyboard reads in `FFXiMain.dll`, after Windower has
 seen them. The chat line reads typed text from window messages, which this hook does not see. See
 [docs/lua-api.md](docs/lua-api.md#the-keyboard) and [docs/abi.md](docs/abi.md#keyhook-1).
+`key_bindings()` copies the client's keyboard bindings, so an addon can warn when a key it
+hides is also a game key. It finds the tables by signature and patches nothing.
 
 ## Drawing offline
 
