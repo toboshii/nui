@@ -253,6 +253,30 @@ reads 10005A89, 10005B20; 1 client: chronicle r1 (drives, hides 10)`.
 
 Give the keys back and leave the hook. `stop()` and unloading do this too.
 
+### `key_bindings([flags]) -> table | nil, why` (1.7.0)
+
+One copy of the client's keyboard bindings, so an addon can tell when a key it hides is also a game key.
+It needs no `key_start` and patches nothing. The client rewrites these tables at run time: at login from
+the character's config, and when the player changes a key. So read them again when you need them.
+
+The table has these fields:
+
+- `actions`: 188 x 3 numbers. The bindings of action id `a` are at `[a*3+1]` to `[a*3+3]`. The low byte
+  is the DirectInput key code, and 0 is an empty binding. The high byte holds the rules: `0x01` Shift
+  held, `0x02` Ctrl held, `0x04` Alt held, `0x08` Ctrl and Alt held, `0x10` Ctrl or Alt held, `0x20`
+  Shift not held, `0x40` not while the chat line has focus, `0x80` neither Ctrl nor Alt held. A binding
+  with no rule bits acts with any modifiers.
+- `categories`: 188 numbers, the category word of each action id, at `[a+1]`.
+- `moves`: the movement entries the client reads, as `key | rule << 8 | context << 16`. The rule is 0
+  for none, 1 Ctrl, 2 Alt, 4 Shift, 8 not Shift and 7 any. A rule 0 key also acts with Ctrl or Alt
+  held, unless it is a shortcut key.
+- `mode`: the keyboard mode, 0 to 2. The movement keys act only in modes 1 and 2. Absent while unknown.
+- `layout`: the keyboard layout. Layouts 2 and 3 move some keys. Absent while unknown.
+
+Without the tables it returns `nil` and the reason: the client is not loaded, or a signature was not
+found, is not unique, or points outside the client's data. `flags` may contain `nosig`, which always
+takes the not-found path (the fail-closed test).
+
 ## Diagnostics
 
 ### `status() -> table`

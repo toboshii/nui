@@ -40,6 +40,12 @@ jobs:
       - name: The keyboard hook's Windows tests build (they run on Windows)
         run: NUI_NORUN=1 sh test/build_key_test.sh
 
+      - name: The keyboard bindings read on the client's real bytes
+        run: sh test/binds_linux/run.sh --self-test
+
+      - name: The keyboard bindings read's Windows test builds (it runs on Windows)
+        run: NUI_NORUN=1 sh test/build_binds_test.sh
+
       - name: Frozen shared-memory layouts
         run: python3 test/frozen_check.py
 

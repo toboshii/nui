@@ -13,6 +13,7 @@
 #include "device.hpp"
 #include "ops.hpp"
 #include "key.hpp"
+#include "binds.hpp"
 #include "pad.hpp"
 #include "textures.hpp"
 #include "ui.hpp"
@@ -2088,7 +2089,9 @@ int host_open(lua_State* L, HostConfig const& cfg, HostFn const* extra, int n_ex
                                  {"pad_status", guarded<l_pad_status>}, {"pad_stop", guarded<l_pad_stop>},
                                  // 1.6.0: keys hidden from the game alone (key.hpp)
                                  {"key_start", guarded<l_key_start>}, {"key_hide", guarded<l_key_hide>},
-                                 {"key_status", guarded<l_key_status>}, {"key_stop", guarded<l_key_stop>}};
+                                 {"key_status", guarded<l_key_status>}, {"key_stop", guarded<l_key_stop>},
+                                 // 1.7.0: the client's keyboard bindings, read only (binds.hpp)
+                                 {"key_bindings", guarded<l_key_bindings>}};
     for (HostFn const& fn : fns) {
         g_lua.pushcclosure(L, fn.f, 0);
         g_lua.setfield(L, -2, fn.name);
