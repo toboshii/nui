@@ -2,9 +2,9 @@
 // PadHook 1: one ABI forever, revisions within it (the rules UiHook/UiHook.h keeps, applied here).
 //
 // With its "Enable XInput" setting on (padmode000 flag 6), the client reads an XInput pad through its own
-// shim, xinputdll.dll in the game folder, which calls xinput1_3.dll. Without that setting the client uses
-// DirectInput8, which PadHook does not hook yet. PadState::source says where a state came from, so a
-// DirectInput source can join the same state, the same mask and the same bus in a later revision.
+// shim, xinputdll.dll in the game folder, which calls xinput1_3.dll. Without that setting, or for a pad that
+// is not an XInput device, the client uses DirectInput8. Revision 4 hooks that too (the DirectInput source,
+// below): the same clients, the same hold and the same chord, on its own part of the bus.
 //
 // There are two routes to the state. A module tries route 1 first, then route 0. bus->route says which one
 // is live (0 also on a bus that a revision 1 or 2 module patched).
@@ -105,6 +105,61 @@
 //      alone when the time is up, the game gets it then. Only those buttons are ever delayed, and only
 //      while nobody holds the pad.
 //
+// The DirectInput source (revision 4). The client reads exactly one pad. It uses XInput when Enable XInput
+// is on and the pad is an XInput device. Otherwise it reads a DirectInput device (DIJOYSTATE2, buttons 0..31
+// mapped to game actions by padsin000), from its input update, once per main loop tick, with two calls:
+//
+//     GetDeviceState(device, 0x110, input+0xA44)            the 272-byte DIJOYSTATE2
+//     GetDeviceData(device, 0x14, input+0xB54, &n, 0)       up to n = 16 buffered events, no DIGDD_PEEK
+//
+// (the 2026-11-02 build: the device at input+0x90). The client takes a button's state from the state read and
+// its press and release edges from the events (DIDEVICEOBJECTDATA: ofs 0x30 + button, data 0x80 pressed, 0
+// released). It reads the sticks (lX .. lRz and the two sliders, ranged -127..127) and POV 0 from the state.
+// So hiding a press means clearing its state byte and dropping its press and release events, and a press the
+// game must still get (a chord button tapped alone) goes back in as events.
+//
+// The sites. Each patch changes one whole instruction of 5 bytes into `call thunk` (E8 <rel32>), in one locked
+// 8-byte compare-and-exchange of the aligned block that holds it, so a thread anywhere in the client's code
+// returns to or reaches a whole instruction either way. The state read is followed by `cmp eax, 0x800700AA`:
+// that is the patch, as KeyHook's. The event read is followed by `test eax, eax`, too short for a call. Its
+// success branch (a jz that nothing else reaches) runs two stores and then `mov byte [esp+0x13], 1`
+// (C6 44 24 13 01), before the client looks at the events: that store is the patch. Its thunk makes the store
+// itself. The client ignores the buffer when the read fails, and so does the hook. Each signature (52 and 100
+// bytes, the second through that store) must match exactly once in FFXiMain.dll's code sections, both must
+// load the device from the same offset of the input object, the event read must follow the state read within
+// PADHOOK_DI_SPAN bytes, and each patched instruction must lie in one aligned 8-byte block. Otherwise nothing
+// is patched, for good in this module, and the status says why.
+//
+//     di block+0    the driving module's DirectInput dispatcher (padhook_di_fn), or null
+//     di block+16   the state read's thunk: push eax, ecx, edx; if a dispatcher drives, call it with
+//                   (PADHOOK_DI_STATE, hr, ebx+buffer, null, 0x110, [ebx+device]); pop; cmp eax, 0x800700AA; ret
+//     di block+72   the event read's thunk: pushfd, pushad; if a dispatcher drives, call it with
+//                   (PADHOOK_DI_EVENTS, 0, edi (the events), ebp (&n), asked, [ebx+device]); popad, popfd;
+//                   mov byte [esp+0x17], 1 (the client's store, past the return address); ret
+//
+// The signatures fix the registers: ebx is the input object, edi the events and ebp the count. The read has
+// already run when either thunk runs, so there is nothing to chain and no original to call. With nobody
+// driving, a thunk runs the client's own instruction and nothing else.
+//
+// The press rules (di_apply_state, di_apply_events), one record per button for both reads:
+//   - a new press is decided once, at the first read that shows it: hidden while a client holds the pad, a
+//     chord button waits for its partner, the game's otherwise;
+//   - a press the game saw stays the game's until its release, and a hidden press stays hidden until its
+//     release, even after the pad is given back (its release event is dropped too);
+//   - while a client holds the pad, every stick and slider reads 0 (the client's centre) and POV 0 reads
+//     centred, unless the game already had the POV held from before;
+//   - the chord, as XInput's: a chord button held back for up to PADHOOK_CHORD_MS; its partner in time makes it
+//     the chord, hidden until released; released alone in time, the game gets a press and a release event; held
+//     alone too long, the game gets a press event then;
+//   - a lost release ends a press once the state shows the button up and an event read returns fewer events
+//     than asked;
+//   - when a module starts to drive after nobody did, every button held at its first state read is the game's.
+// The device's maker and product (GetDeviceInfo, once per device) go into the bus for the client to read.
+//
+// Ownership of the DirectInput dispatch follows the XInput rules on its own: the live rev 4 client with the
+// highest revision drives (PadDiHook::owner), and a rev 4 module hands it on in DllMain. Modules below rev 4
+// never touch PadBus::di; their captures hold the DirectInput pad too.
+//
 // ABI and revisions: mapping Local\FFXiPadHook_v1_<pid>, always PADHOOK_MAP_BYTES, mapped whole.
 // Offsets are frozen (test/layout_padhook.txt); new fields only go into the reserved tails, and zero
 // means the old behaviour. A module leaves in DllMain(DLL_PROCESS_DETACH) with
@@ -130,7 +185,7 @@
 
 #define PADHOOK_ABI_VERSION 1u             // never changes again
 #ifndef PADHOOK_REV
-#define PADHOOK_REV 3                      // this file's revision within ABI 1 (tests override it); 2: the chord; 3: route 1
+#define PADHOOK_REV 4                      // this file's revision within ABI 1 (tests override it); 2: the chord; 3: route 1; 4: DirectInput
 #endif
 #define PADHOOK_MAX_CLIENTS 16
 #define PADHOOK_INDEXES 4                  // XInput user indexes 0..3
@@ -167,7 +222,21 @@
 // PadState::source
 #define PADHOOK_SRC_NONE 0
 #define PADHOOK_SRC_XINPUT 1
-#define PADHOOK_SRC_DINPUT 2               // reserved: a later revision
+#define PADHOOK_SRC_DINPUT 2               // rev 4: PadBus::di (the DirectInput source keeps its own state)
+
+// rev 4: the DirectInput source
+#define PADHOOK_DI_SITES "FFXiMain's DirectInput pad reads"   // the sites' name in status lines
+#define PADHOOK_DI_SPAN 0x1000             // the event read follows the state read within this many bytes
+#define PADHOOK_DI_BUTTONS 32              // the client maps DirectInput buttons 0..31 (padsin000 values below 32)
+#define PADHOOK_DI_MAX_EVENTS 64           // the most events one read may ask for (the client asks for 16)
+#define PADHOOK_DI_FRESH_MS 1000           // a pad the client read this recently is the pad the game reads
+#define PADHOOK_POV_CENTRED 0xFFFFFFFFul   // DirectInput's centred POV
+#define PADHOOK_DI_STATE 0                 // padhook_di_fn's kind: data is the DIJOYSTATE2, asked its size
+#define PADHOOK_DI_EVENTS 1                // data is DIDEVICEOBJECTDATA[*count], asked the count asked for
+#define PADHOOK_JS_BYTES 0x110             // sizeof(DIJOYSTATE2)
+#define PADHOOK_JS_POV 0x20                // its rgdwPOV[0]
+#define PADHOOK_JS_BUTTONS 0x30            // its rgbButtons[0]
+#define PADHOOK_JS_AXES 8                  // lX lY lZ lRx lRy lRz rglSlider[0] rglSlider[1], LONGs from offset 0
 
 // Buttons are XInput's XINPUT_GAMEPAD_* bits; the triggers take two bits of their own above them
 // (a trigger is "held" past PADHOOK_TRIGGER_DOWN), so one mask covers everything that can be pressed.
@@ -193,6 +262,19 @@ struct PadXState {
 static_assert(sizeof(PadXState) == 16, "XINPUT_STATE is 16 bytes");
 
 typedef DWORD(__stdcall* padhook_get_fn)(DWORD index, PadXState* state);
+
+// rev 4: the DirectInput dispatcher. The thunks call it after each read, on the thread that read (the client's main thread).
+typedef void(__stdcall* padhook_di_fn)(DWORD kind, LONG hr, void* data, DWORD* count, DWORD asked, void* device);
+
+// DirectInput's DIDEVICEOBJECTDATA (DirectInput 8, 32-bit), declared here so no SDK header is needed
+struct PadDiEvent {
+    DWORD ofs;                       // DIJOYSTATE2: 0x30 + button for a button
+    DWORD data;                      // 0x80 pressed, 0 released
+    DWORD time;
+    DWORD seq;
+    DWORD app;
+};
+static_assert(sizeof(PadDiEvent) == 20, "DIDEVICEOBJECTDATA is 20 bytes");
 
 // 32 bytes: what the game read last, raw (before any mask), per user index.
 struct PadState {
@@ -230,7 +312,9 @@ struct PadClient {
     LONG nonce;
     char name[16];
     unsigned long chord;             // rev 2: the buttons that take this client's pad together (0: none)
-    unsigned char reserved[12];
+    unsigned long di_chord;          // rev 4: the same chord as DirectInput buttons (bit i: button i; 0: none)
+    padhook_di_fn di_dispatch;       // rev 4: this client's module's DirectInput dispatcher (null below rev 4)
+    unsigned char reserved[4];
 };
 
 // 24 bytes (rev 2, in the bus header's reserved tail): the chord step's working state.
@@ -243,6 +327,74 @@ struct PadChord {
     unsigned long prev;              // the chord buttons held at the last read
 };
 static_assert(sizeof(PadChord) == 24, "PadChord is 24 bytes forever");
+
+// rev 4, 128 bytes: what the game read last from its DirectInput pad, raw (before the mask)
+struct PadDiState {
+    unsigned long seq;               // changes with every change of the fields below but tick and reads; 0 = never read
+    unsigned long buttons;           // bit i: button i held (0..31), from the state read
+    unsigned long pov;               // POV 0, hundredths of a degree clockwise from up (PADHOOK_POV_CENTRED: centred)
+    long axes[PADHOOK_JS_AXES];      // lX lY lZ lRx lRy lRz and the two sliders (the client ranges them -127..127)
+    unsigned long tick;              // GetTickCount() of the last state read
+    unsigned long reads;             // state reads
+    long hr;                         // the last state read's result
+    unsigned long vidpid;            // the device's maker and product, MAKELONG(vendor, product) (0: not known)
+    void* device;                    // the device the client read last
+    char name[32];                   // its product name (cut short)
+    unsigned char reserved[32];
+};
+
+// rev 4, 128 bytes: the DirectInput dispatcher's own working state, one bit per button (0..31)
+struct PadDiPress {
+    unsigned long chord;             // the union of the live clients' DirectInput chords, refreshed every read
+    unsigned long game;              // the game saw the current press
+    unsigned long hid;               // the current press is hidden from the game until its release
+    unsigned long wait;              // chord buttons held back from the game, waiting for a partner
+    unsigned long wait_since;        // GetTickCount() when the first of them went down
+    unsigned long tap;               // waited buttons released alone in time: owed to the game as a press and a release
+    unsigned long late;              // waited buttons held alone too long: the game's, owed a press event
+    unsigned long swallow;           // their own release event is still to come, and is dropped
+    unsigned long down;              // held at the last state read (raw)
+    unsigned long pov_out;           // the POV the game was last given
+    volatile LONG state_ok;          // the last state read succeeded (down is current)
+    volatile LONG primed;            // 0: the next state read gives every held button to the game (a driver started)
+    volatile LONG was_captured;
+    unsigned char pov_pass;          // the POV was held, and the game had it, when the pad was taken: the game's until centred
+    unsigned char pov_hid;           // the POV went off centre while the pad was held: centred until it centres
+    unsigned char reserved_b[2];
+    unsigned long hidden;            // presses hidden from the game, ever (status)
+    unsigned long dropped;           // events dropped, ever
+    unsigned long injected;          // presses given back to the game as events (chord taps, late chord buttons), ever
+    unsigned long ended;             // hidden presses ended without their release event, ever
+    unsigned long chords;            // chords kept from the game, ever
+    unsigned long event_reads;
+    unsigned char reserved[48];
+};
+
+// rev 4, 640 bytes: the DirectInput source, its own patch, dispatch, state and status
+struct PadDiHook {
+    volatile LONG installed;         // both sites are patched
+    volatile LONG install_lock;
+    volatile LONG blocked;           // the sites cannot be patched safely in this process
+    unsigned char* block;            // never freed
+    padhook_di_fn volatile* dispatch_ptr;
+    std::uintptr_t site_state;       // the cmp after GetDeviceState
+    std::uintptr_t site_events;      // the client's store on the event read's success branch
+    unsigned long device_disp;       // where the input object holds the pad device (from the sites)
+    unsigned long buffer_disp;       // ... and the state buffer
+    volatile LONG owner;             // the driving client's slot + 1 (0: nobody drives)
+    volatile LONG owner_rev;
+    volatile LONG calls;             // reads through the dispatcher
+    volatile LONG in_flight;
+    volatile LONG write_lock;        // the dispatcher's writes (one thread at a time; others only hide)
+    volatile LONG wseq;              // seqlock over `pad`: odd while written
+    volatile LONG handovers;
+    volatile LONG installs;
+    unsigned char reserved_hdr[60];
+    PadDiState pad;                  // at 128
+    PadDiPress press;                // at 256
+    char status[192];
+    unsigned char reserved[64];
+};
 
 // 4096 bytes mapped; offsets frozen.
 struct PadBus {
@@ -275,10 +427,15 @@ struct PadBus {
     PadMask masks[PADHOOK_INDEXES];  // 192
     PadClient clients[PADHOOK_MAX_CLIENTS];   // 1024
     char status[192];
+    PadDiHook di;                    // rev 4 (zero: no DirectInput source, the rev 3 behaviour)
     // append here only
 };
 
 static_assert(sizeof(PadState) == 32, "PadState is 32 bytes forever");
+static_assert(sizeof(PadDiState) == 128, "PadDiState is 128 bytes forever");
+static_assert(sizeof(PadDiPress) == 128, "PadDiPress is 128 bytes forever");
+static_assert(sizeof(PadDiHook) == 640, "PadDiHook is 640 bytes forever");
+static_assert(offsetof(PadBus, di) == 1664, "PadBus::di follows status");
 static_assert(sizeof(PadMask) == 48, "PadMask is 48 bytes forever");
 static_assert(sizeof(PadClient) == 64, "PadClient is 64 bytes forever");
 static_assert(offsetof(PadBus, pads) == 128, "PadBus header is 128 bytes");
@@ -365,6 +522,8 @@ inline void reg_unlock(PadBus* bus) { InterlockedExchange(&bus->reg_lock, 0); }
 inline void clear_client(PadClient& c) {
     InterlockedExchange(&c.capture, 0);
     c.chord = 0;
+    c.di_chord = 0;
+    c.di_dispatch = nullptr;
     c.dispatch = nullptr;
     c.rev = 0;
     c.module = nullptr;
@@ -906,6 +1065,669 @@ inline char const* slot_values(WrapperHit const& hit) {
     return why;
 }
 
+// ---- rev 4: the DirectInput source ----
+
+inline volatile DWORD& last_di_tid() { static volatile DWORD value = 0; return value; }
+
+inline bool pov_centred(unsigned long pov) { return (pov & 0xFFFFul) == 0xFFFFul; }
+inline unsigned long di_bit(unsigned i) { return 1ul << (i & 31u); }
+inline unsigned long di_count(unsigned long bits) { return static_cast<unsigned long>(__builtin_popcountl(bits)); }
+
+// The buttons a DIJOYSTATE2 holds down, 0..31 (the ones the client maps).
+inline unsigned long di_raw_buttons(unsigned char const* js) {
+    unsigned long raw = 0;
+    for (unsigned i = 0; i < PADHOOK_DI_BUTTONS; ++i) if (js[PADHOOK_JS_BUTTONS + i] & 0x80) raw |= di_bit(i);
+    return raw;
+}
+
+// The union of the live rev 4 clients' DirectInput chords.
+inline unsigned long di_chords(PadBus const* bus) {
+    unsigned long all = 0;
+    for (int i = 0; i < PADHOOK_MAX_CLIENTS; ++i) {
+        PadClient const& c = bus->clients[i];
+        if (c.occupied == 2 && c.rev >= 4) all |= c.di_chord;
+    }
+    return all;
+}
+
+// A new press of the buttons in `fresh` (from a state read, or one press event; `held` is every button held now):
+// hidden while a client holds the pad; a chord button waits for its partner while no chord button the game already
+// has is held; the game's otherwise. A chord whose buttons all wait is then kept from the game, each button until its
+// release. Pure: tests call it.
+inline void di_decide(PadDiPress& k, unsigned long fresh, unsigned long held, bool cap, DWORD now) {
+    if (!fresh) return;
+    if (cap) {
+        k.hid |= fresh;
+        k.hidden += di_count(fresh);
+        return;
+    }
+    unsigned long const C = k.chord;
+    unsigned long wait = 0;
+#ifndef PADHOOK_FAULT_DI_NO_CHORD
+    if (C && (held & C & ~fresh & ~k.wait) == 0) wait = fresh & C;
+#else
+    (void)held;
+#endif
+    if (wait) {
+        if (!k.wait) k.wait_since = now;
+        k.wait |= wait;
+    }
+    k.game |= fresh & ~wait;
+    if (C && (C & ~k.wait) == 0) {
+        k.hid |= C;
+        k.wait &= ~C;
+        ++k.chords;
+    }
+}
+
+// The state read: the DIJOYSTATE2 that GetDeviceState filled, changed in place. Pure on its inputs: tests call it.
+inline void di_apply_state(PadDiPress& k, unsigned char* js, bool cap, DWORD now) {
+    unsigned long const raw = di_raw_buttons(js);
+    unsigned long pov = 0;
+    std::memcpy(&pov, js + PADHOOK_JS_POV, 4);
+    if (cap && !k.was_captured) k.pov_pass = !pov_centred(k.pov_out) && !pov_centred(pov) ? 1 : 0;
+#ifdef PADHOOK_FAULT_DI_TAKE_HELD
+    if (cap && !k.was_captured) { k.hid |= k.game & raw; k.game &= ~raw; }
+#endif
+#ifdef PADHOOK_FAULT_DI_LEAK_HELD
+    if (!cap) { k.game |= k.hid & raw; k.hid &= ~raw; }
+#endif
+    if (cap && k.wait) {                            // the pad taken while a chord button waits: a press made under the hold
+        k.hid |= k.wait;
+        k.hidden += di_count(k.wait);
+        k.wait = 0;
+    }
+    // a waiting chord button released alone in time: a tap the game still gets, as a press and a release event
+    unsigned long const gone = k.wait & ~raw;
+#ifndef PADHOOK_FAULT_DI_NO_TAP
+    k.tap |= gone;
+    k.swallow |= gone;
+#endif
+    k.wait &= ~gone;
+    // a chord button that waited too long went up before its press event went in: owed as a tap now
+    unsigned long const late_gone = k.late & ~raw;
+    k.late &= ~late_gone;
+    k.game &= ~late_gone;
+    k.tap |= late_gone;
+    k.swallow |= late_gone;
+    // held alone too long, or no chord any more: the game's now, with a press event at the next event read
+    if (k.wait && (k.chord == 0 || now - k.wait_since > PADHOOK_CHORD_MS)) {
+        k.late |= k.wait;
+        k.game |= k.wait;
+        k.wait = 0;
+    }
+    unsigned long const fresh = raw & ~(k.game | k.hid | k.wait | k.tap | k.swallow);
+    di_decide(k, fresh, raw, cap, now);
+    unsigned long const out = raw & (k.hid | k.wait | k.tap | k.swallow);
+    for (unsigned i = 0; i < PADHOOK_DI_BUTTONS; ++i) if (out & di_bit(i)) js[PADHOOK_JS_BUTTONS + i] = 0;
+    k.down = raw;
+    InterlockedExchange(&k.state_ok, 1);
+    // the sticks and the POV: centred while a client holds the pad
+#ifndef PADHOOK_FAULT_DI_NO_CENTRE
+    if (cap) {
+        auto* axes = reinterpret_cast<LONG*>(js);
+        for (int a = 0; a < PADHOOK_JS_AXES; ++a) axes[a] = 0;
+    }
+#endif
+    if (pov_centred(pov)) {
+        k.pov_pass = 0;
+        k.pov_hid = 0;
+    } else if (cap ? !k.pov_pass : k.pov_hid != 0) {
+        k.pov_hid = 1;
+        pov = PADHOOK_POV_CENTRED;
+        std::memcpy(js + PADHOOK_JS_POV, &pov, 4);
+    }
+    k.pov_out = pov;
+    k.was_captured = cap ? 1 : 0;
+}
+
+// The event read: the events GetDeviceData returned, rewritten in place, and *count with them. The client has room for
+// `asked` events, so the presses owed to the game (a chord button tapped alone, or held alone too long) go in only while
+// there is room; the rest wait for a later read. Pure on its inputs: tests call it.
+inline void di_apply_events(PadDiPress& k, PadDiEvent* ev, DWORD* count, DWORD asked, bool cap, DWORD now) {
+    ++k.event_reads;
+    if (!ev || !count) return;
+    DWORD n = *count;
+    if (asked && n > asked) n = asked;
+    DWORD const room = asked ? asked : n;
+    if (n > PADHOOK_DI_MAX_EVENTS || room > PADHOOK_DI_MAX_EVENTS) {
+        // more than the client ever asks for: drop what is hidden, add nothing
+        DWORD o = 0;
+        for (DWORD j = 0; j < n; ++j) {
+            PadDiEvent const e = ev[j];
+            if (e.ofs >= PADHOOK_JS_BUTTONS && e.ofs < PADHOOK_JS_BUTTONS + PADHOOK_DI_BUTTONS
+                && ((k.hid | k.wait | k.swallow) & di_bit(e.ofs - PADHOOK_JS_BUTTONS))) { ++k.dropped; continue; }
+            ev[o++] = e;
+        }
+        *count = o;
+        return;
+    }
+    PadDiEvent in[PADHOOK_DI_MAX_EVENTS];
+    std::memcpy(in, ev, n * sizeof(PadDiEvent));
+    DWORD o = 0;
+    auto put = [&](PadDiEvent const& e) { ev[o++] = e; };
+    auto made = [&](unsigned i, DWORD data, DWORD time) { return PadDiEvent {PADHOOK_JS_BUTTONS + i, data, time, 0, 0}; };
+    unsigned long pressed = 0;              // a press in this read, with no release after it
+    for (DWORD j = 0; j < n; ++j) {
+        PadDiEvent const e = in[j];
+        DWORD const left = n - j - 1;      // input events still to come, each of which needs its slot
+        if (e.ofs < PADHOOK_JS_BUTTONS || e.ofs >= PADHOOK_JS_BUTTONS + PADHOOK_DI_BUTTONS) { put(e); continue; }
+        unsigned const i = e.ofs - PADHOOK_JS_BUTTONS;
+        unsigned long const b = di_bit(i);
+#ifdef PADHOOK_FAULT_DI_NO_EVENTS
+        (void)left; (void)cap; (void)now; (void)made;
+        put(e);
+        continue;
+#endif
+        if (e.data & 0x80) {
+            pressed |= b;
+            if ((k.tap | k.swallow) & b) {   // a press before a tap's release came: that release was lost
+                k.tap &= ~b;
+                k.swallow &= ~b;
+            }
+            if (k.late & b) { k.late &= ~b; put(e); }           // the press the game was owed: this one
+            else if (k.game & b) put(e);
+            else if ((k.hid | k.wait) & b) ++k.dropped;
+            else {
+                di_decide(k, b, k.down | pressed, cap, now);
+                if (k.game & b) put(e);
+                else ++k.dropped;
+            }
+        } else {
+            pressed &= ~b;
+            if ((k.late | k.wait | k.tap) & b) {
+                // released before the game got its press: the game gets a press, then this release
+                bool const was_late = (k.late & b) != 0;
+                k.late &= ~b;
+                k.wait &= ~b;
+                k.tap &= ~b;
+                k.swallow &= ~b;
+                k.game &= ~b;
+                if (o + 2 + left <= room) {
+                    put(made(i, 0x80, e.time));
+                    put(e);
+                    ++k.injected;
+                } else {
+                    k.tap |= b;              // no room now: a press and a release at a later read (this release is used up)
+                    ++k.dropped;
+                    (void)was_late;
+                }
+            } else if (k.game & b) { k.game &= ~b; put(e); }
+            else if (k.hid & b) { k.hid &= ~b; ++k.dropped; }
+            else if (k.swallow & b) { k.swallow &= ~b; ++k.dropped; }
+            else put(e);                   // a release the game never saw pressed: as the client gets it without nui
+        }
+    }
+    // what is still owed, while there is room
+    for (unsigned i = 0; i < PADHOOK_DI_BUTTONS; ++i) {
+        unsigned long const b = di_bit(i);
+        if ((k.tap & b) && o + 2 <= room) {
+            put(made(i, 0x80, now));
+            put(made(i, 0, now));
+            k.tap &= ~b;
+            ++k.injected;
+        } else if ((k.late & b) && o + 1 <= room) {
+            put(made(i, 0x80, now));
+            k.late &= ~b;
+            ++k.injected;
+        }
+    }
+    *count = o;
+#ifndef PADHOOK_FAULT_DI_NO_DRAIN
+    if (asked && n < asked && k.state_ok) {   // the buffer is empty: a press shown up in the state, with no press since, is over
+        unsigned long const ends = (k.game | k.hid | k.swallow) & ~k.down & ~pressed & ~k.late;
+        k.ended += di_count(k.hid & ends);
+        k.game &= ~ends;
+        k.hid &= ~ends;
+        k.swallow &= ~ends;
+    }
+#endif
+}
+
+// A second thread reads while the first writes: hide what is hidden, change nothing else.
+inline void di_hide_only(PadDiPress const& k, DWORD kind, void* data, DWORD* count, DWORD asked) {
+    unsigned long const out = k.hid | k.wait | k.tap | k.swallow;
+    if (kind == PADHOOK_DI_STATE && asked >= PADHOOK_JS_BYTES) {
+        auto* js = static_cast<unsigned char*>(data);
+        for (unsigned i = 0; i < PADHOOK_DI_BUTTONS; ++i) if (out & di_bit(i)) js[PADHOOK_JS_BUTTONS + i] = 0;
+        if (k.was_captured) {
+            auto* axes = reinterpret_cast<LONG*>(js);
+            for (int a = 0; a < PADHOOK_JS_AXES; ++a) axes[a] = 0;
+        }
+    } else if (kind == PADHOOK_DI_EVENTS && count) {
+        auto* ev = static_cast<PadDiEvent*>(data);
+        DWORD o = 0, n = asked && *count > asked ? asked : *count;
+        for (DWORD j = 0; j < n; ++j) {
+            PadDiEvent const e = ev[j];
+            if (e.ofs >= PADHOOK_JS_BUTTONS && e.ofs < PADHOOK_JS_BUTTONS + PADHOOK_DI_BUTTONS
+                && (out & di_bit(e.ofs - PADHOOK_JS_BUTTONS))) continue;
+            ev[o++] = e;
+        }
+        *count = o;
+    }
+}
+
+// What the client read, raw, for every module to read (behind the seqlock). js: null when the read failed.
+inline void di_record(PadDiHook& h, LONG hr, unsigned char const* js, DWORD now) {
+    PadDiState& p = h.pad;
+    unsigned long const buttons = js ? di_raw_buttons(js) : 0;
+    unsigned long pov = PADHOOK_POV_CENTRED;
+    long axes[PADHOOK_JS_AXES] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (js) {
+        std::memcpy(&pov, js + PADHOOK_JS_POV, 4);
+        std::memcpy(axes, js, sizeof(axes));
+    }
+    bool const same = p.seq != 0 && (p.hr >= 0) == (hr >= 0) && p.buttons == buttons && p.pov == pov
+        && std::memcmp(p.axes, axes, sizeof(axes)) == 0;
+    InterlockedIncrement(&h.wseq);
+    MemoryBarrier();
+    p.tick = now;
+    ++p.reads;
+    p.hr = hr;
+    if (!same) {
+        p.buttons = buttons;
+        p.pov = pov;
+        std::memcpy(p.axes, axes, sizeof(axes));
+        ++p.seq;
+        if (p.seq == 0) p.seq = 1;
+    }
+    MemoryBarrier();
+    InterlockedIncrement(&h.wseq);
+}
+
+// The device's maker, product and name, from its own GetDeviceInfo (vtable +0x3C), once per device the client reads.
+// guidProduct is {PPPPVVVV-0000-0000-0000-504944564944} ("PIDVID") for a HID device; otherwise the maker is not known.
+constexpr std::size_t kDiInstanceBytes = 580;             // DIDEVICEINSTANCEA
+constexpr std::size_t kDiProductAt = 20, kDiNameAt = 300; // guidProduct, tszProductName
+inline void di_identify(PadDiHook& h, void* device) {
+    unsigned long vidpid = 0;
+    char name[32] = {};
+    auto const dev = reinterpret_cast<std::uintptr_t>(device);
+    if (span_readable(dev, 4)) {
+        std::uintptr_t const vtbl = *reinterpret_cast<std::uintptr_t const*>(dev);
+        if (span_readable(vtbl + 0x3C, 4)) {
+            void* const fn = *reinterpret_cast<void* const*>(vtbl + 0x3C);
+            if (code_in_module(fn, nullptr)) {
+                typedef LONG(__stdcall* info_fn)(void* self, void* instance);
+                unsigned char info[kDiInstanceBytes] = {};
+                DWORD const size = kDiInstanceBytes;
+                std::memcpy(info, &size, 4);
+                if (reinterpret_cast<info_fn>(fn)(device, info) >= 0) {
+                    static unsigned char const kPidVid[10] = {0, 0, 0, 0, 0, 0, 'P', 'I', 'D', 'V'};
+                    if (std::memcmp(info + kDiProductAt + 4, kPidVid, sizeof(kPidVid)) == 0
+                        && info[kDiProductAt + 14] == 'I' && info[kDiProductAt + 15] == 'D')
+                        std::memcpy(&vidpid, info + kDiProductAt, 4);
+                    for (std::size_t i = 0; i + 1 < sizeof(name) && info[kDiNameAt + i]; ++i)
+                        name[i] = static_cast<char>(info[kDiNameAt + i]);
+                }
+            }
+        }
+    }
+    InterlockedIncrement(&h.wseq);
+    MemoryBarrier();
+    h.pad.device = device;
+    h.pad.vidpid = vidpid;
+    std::memcpy(h.pad.name, name, sizeof(name));
+    ++h.pad.seq;
+    if (h.pad.seq == 0) h.pad.seq = 1;
+    MemoryBarrier();
+    InterlockedIncrement(&h.wseq);
+}
+
+// The DirectInput dispatcher: one copy per module, called from the thunks after each read, on the client's main thread.
+inline void PADHOOK_ALIGN_STACK __stdcall di_dispatch(DWORD kind, LONG hr, void* data, DWORD* count, DWORD asked, void* device) {
+    PadBus* bus = cached_bus();
+    if (!bus) return;
+    PadDiHook& h = bus->di;
+    InterlockedIncrement(&h.in_flight);
+    InterlockedIncrement(&h.calls);
+    last_di_tid() = GetCurrentThreadId();
+    PadDiPress& k = h.press;
+    if (InterlockedCompareExchange(&h.write_lock, 1, 0) == 0) {
+        DWORD const now = GetTickCount();
+        bool const cap = captured(bus, now);
+        k.chord = di_chords(bus);
+        if (kind == PADHOOK_DI_STATE) {
+            if (device && device != h.pad.device) di_identify(h, device);
+            if (hr >= 0 && data && asked >= PADHOOK_JS_BYTES) {
+                auto* js = static_cast<unsigned char*>(data);
+#ifndef PADHOOK_FAULT_DI_NO_PRIME
+                if (!k.primed) {                 // a button held when the driving started stays the game's
+                    k.game |= di_raw_buttons(js) & ~(k.hid | k.wait | k.tap | k.swallow);
+                    InterlockedExchange(&k.primed, 1);
+                }
+#endif
+                di_record(h, hr, js, now);
+                di_apply_state(k, js, cap, now);
+            } else {
+                InterlockedExchange(&k.state_ok, 0);   // the client clears the state itself; down is stale
+                di_record(h, hr, nullptr, now);
+            }
+        } else if (kind == PADHOOK_DI_EVENTS) {
+            if (hr >= 0) di_apply_events(k, static_cast<PadDiEvent*>(data), count, asked, cap, now);
+        }                                              // another kind: a later revision's, nothing to do
+        InterlockedExchange(&h.write_lock, 0);
+    } else if (hr >= 0 && data) {
+        di_hide_only(k, kind, data, count, asked);
+    }
+    InterlockedDecrement(&h.in_flight);
+}
+
+// -1 is a wildcard. The device's and the buffer's offsets, and the count asked for, are read from the match.
+constexpr short kDiStateSig[52] = {
+    0x8A, 0x8B, -1, -1, -1, -1,                  // mov cl, [ebx+..]          the client's "needs Poll" flag
+    0x84, 0xC9, 0x74, 0x06,                      // test cl, cl / jz +6
+    0x8B, 0x08, 0x50, 0xFF, 0x51, 0x64,          // mov ecx, [eax] / push eax / call [ecx+0x64]      Poll
+    0x8B, 0xCB, 0xE8, -1, -1, -1, -1,            // mov ecx, ebx / call         the client's force feedback
+    0x8B, 0x83, -1, -1, -1, -1,                  // mov eax, [ebx+disp]       the pad device
+    0x8D, 0x8B, -1, -1, -1, -1, 0x51,            // lea ecx, [ebx+..] / push ecx              the state buffer
+    0x68, 0x10, 0x01, 0x00, 0x00,                // push 0x110                sizeof(DIJOYSTATE2)
+    0x8B, 0x10, 0x50, 0xFF, 0x52, 0x24,          // mov edx, [eax] / push eax / call [edx+0x24]   GetDeviceState
+    0x3D, 0xAA, 0x00, 0x07, 0x80,                // cmp eax, 0x800700AA       the patch
+};
+constexpr short kDiEventsSig[100] = {
+    0x8D, 0xAB, -1, -1, -1, -1,                  // lea ebp, [ebx+..]         the count
+    0xC7, 0x45, 0x00, -1, -1, -1, -1,            // mov dword [ebp], asked
+    0xA0, -1, -1, -1, -1, 0x84, 0xC0,            // mov al, [the gamepad setting] / test al, al
+    0x0F, 0x84, -1, -1, -1, -1,                  // jz                        (the gamepad is off)
+    0x8B, 0x83, -1, -1, -1, -1,                  // mov eax, [ebx+disp]       the pad device
+    0x85, 0xC0, 0x0F, 0x84, -1, -1, -1, -1,      // test eax, eax / jz        (no pad)
+    0x8B, 0x10,                                  // mov edx, [eax]
+    0x8D, 0xBB, -1, -1, -1, -1,                  // lea edi, [ebx+..]         the events
+    0x6A, 0x00, 0x55, 0x57, 0x6A, 0x14, 0x50,    // push 0 (no DIGDD_PEEK) / push ebp / push edi / push 0x14 / push eax
+    0xFF, 0x52, 0x28,                            // call [edx+0x28]           GetDeviceData
+    0x85, 0xC0, 0x74, 0x15,                      // test eax, eax / jz +0x15  (it read: to the stores below)
+    0xB9, -1, -1, -1, -1, 0x33, 0xC0,            // mov ecx, .. / xor eax, eax      (it failed: the buffer cleared ...)
+    0xC7, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00,    // mov dword [ebp], 0
+    0xF3, 0xAB, 0xE9, -1, -1, -1, -1,            // rep stosd / jmp           (... and the events skipped)
+    0xA1, -1, -1, -1, -1,                        // mov eax, [..]
+    0xC6, 0x05, -1, -1, -1, -1, 0x00,            // mov byte [..], 0
+    0xC6, 0x44, 0x24, 0x13, 0x01,                // mov byte [esp+0x13], 1    the patch
+};
+constexpr std::size_t kDiStateCmpAt = 47, kDiStateDevAt = 25, kDiStateBufAt = 31;
+constexpr std::size_t kDiEventsStoreAt = 95, kDiEventsDevAt = 28, kDiEventsAskedAt = 9;
+constexpr unsigned char kDiCmp[5] = {0x3D, 0xAA, 0x00, 0x07, 0x80};         // cmp eax, 0x800700AA
+constexpr unsigned char kDiStore[5] = {0xC6, 0x44, 0x24, 0x13, 0x01};       // mov byte [esp+0x13], 1
+inline constexpr char kDiChanged[] = "changed while they were patched";
+
+template <std::size_t N>
+inline bool di_sig_at(unsigned char const* p, short const (&sig)[N]) {
+    for (std::size_t i = 0; i < N; ++i)
+        if (sig[i] >= 0 && p[i] != static_cast<unsigned char>(sig[i])) return false;
+    return true;
+}
+
+struct DiScan {
+    int state_count, events_count;
+    std::uintptr_t state_at, events_at;      // the first match of each (its first byte)
+    std::uint32_t state_disp, events_disp;   // the device's offset at each
+    std::uint32_t buffer_disp;               // the state buffer's offset
+    std::uint32_t asked;                     // the event read's count
+};
+
+// Both signatures over n bytes at p, which the process sees at `base`. Adds to s (several runs make one scan). Pure.
+inline void di_scan_sites(unsigned char const* p, std::size_t n, std::uintptr_t base, DiScan& s) {
+    constexpr std::size_t kA = sizeof(kDiStateSig) / sizeof(short), kB = sizeof(kDiEventsSig) / sizeof(short);
+    for (std::size_t off = 0; off + kA <= n; ++off) {
+        if (p[off] == 0x8A && p[off + 1] == 0x8B && di_sig_at(p + off, kDiStateSig)) {
+#ifdef PADHOOK_FAULT_DI_FIRST_MATCH
+            if (s.state_count > 0) continue;
+#endif
+            if (s.state_count++ == 0) {
+                s.state_at = base + off;
+                s.state_disp = le32(p + off + kDiStateDevAt);
+                s.buffer_disp = le32(p + off + kDiStateBufAt);
+            }
+        }
+        if (off + kB <= n && p[off] == 0x8D && p[off + 1] == 0xAB && di_sig_at(p + off, kDiEventsSig)) {
+#ifdef PADHOOK_FAULT_DI_FIRST_MATCH
+            if (s.events_count > 0) continue;
+#endif
+            if (s.events_count++ == 0) {
+                s.events_at = base + off;
+                s.events_disp = le32(p + off + kDiEventsDevAt);
+                s.asked = le32(p + off + kDiEventsAskedAt);
+            }
+        }
+    }
+}
+
+// Can 5 bytes at `at` be written with one aligned 8-byte compare-and-exchange?
+inline bool di_fits_one_block(std::uintptr_t at) { return at % 8 <= 3; }
+
+// What the scan means: null when it can be patched, otherwise why not. Pure: tests call it.
+inline char const* di_scan_verdict(DiScan const& s) {
+    if (s.state_count == 0) return "were not found: no GetDeviceState read of the pad (a client update?)";
+    if (s.events_count == 0) return "were not found: no GetDeviceData read of the pad (a client update?)";
+    if (s.state_count > 1) return "are not unique: several GetDeviceState reads of the pad";
+    if (s.events_count > 1) return "are not unique: several GetDeviceData reads of the pad";
+    if (s.state_disp != s.events_disp) return "read two devices (the offsets differ)";
+    if (s.events_at <= s.state_at || s.events_at - s.state_at > PADHOOK_DI_SPAN) return "are not in one function";
+    if (s.asked == 0 || s.asked > PADHOOK_DI_MAX_EVENTS) return "ask for an odd count of events";
+    if (!di_fits_one_block(s.state_at + kDiStateCmpAt) || !di_fits_one_block(s.events_at + kDiEventsStoreAt))
+        return "are not on 8-byte boundaries that one write can patch";
+    return nullptr;
+}
+
+constexpr std::size_t kDiBlockBytes = 128;
+constexpr std::size_t kDiStateThunkAt = 16, kDiStateThunkBytes = 50;
+constexpr std::size_t kDiEventsThunkAt = 72, kDiEventsThunkBytes = 39;
+
+// The state read's thunk (kDiStateThunkBytes). ebx is the input object: the signature fixes it.
+inline void di_state_thunk_bytes(std::uintptr_t block, std::uint32_t device_disp, std::uint32_t buffer_disp, unsigned char* t) {
+    unsigned char code[kDiStateThunkBytes] = {
+        0x50, 0x51, 0x52,                        // push eax / push ecx / push edx       eax: the read's HRESULT, kept
+        0x8B, 0x0D, 0, 0, 0, 0,                  // mov ecx, [dispatch]
+        0x85, 0xC9, 0x74, 0x1C,                  // test ecx, ecx / jz done               nobody drives: the cmp alone
+        0xFF, 0xB3, 0, 0, 0, 0,                  // push [ebx+device]                     the device
+        0x68, 0x10, 0x01, 0x00, 0x00,            // push 0x110                            the state's size, as asked
+        0x6A, 0x00,                              // push 0                                no count
+        0x8D, 0x93, 0, 0, 0, 0,                  // lea edx, [ebx+buffer]
+        0x52,                                    // push edx                              the state
+        0xFF, 0x74, 0x24, 0x18,                  // push [esp+24]                         the HRESULT
+        0x6A, PADHOOK_DI_STATE,                  // push kind
+        0xFF, 0xD1,                              // call ecx                              __stdcall: pops its 6 arguments
+        0x5A, 0x59, 0x58,                        // done: pop edx / pop ecx / pop eax
+        0x3D, 0xAA, 0x00, 0x07, 0x80,            // cmp eax, 0x800700AA                   the client's own cmp, on its eax
+        0xC3,                                    // ret                                   ret keeps the flags
+    };
+    auto const d = static_cast<std::uint32_t>(block);
+    std::memcpy(code + 5, &d, 4);
+    std::memcpy(code + 15, &device_disp, 4);
+    std::memcpy(code + 28, &buffer_disp, 4);
+#ifdef PADHOOK_FAULT_DI_NO_CMP
+    code[44] = code[45] = code[46] = code[47] = code[48] = 0x90;   // the flags the jumps after it test are the thunk's own
+#endif
+    std::memcpy(t, code, kDiStateThunkBytes);
+}
+
+// The event read's thunk (kDiEventsThunkBytes), on the read's success branch. ebx is the input object, edi the events
+// and ebp the count: the signature fixes them.
+inline void di_events_thunk_bytes(std::uintptr_t block, std::uint32_t device_disp, std::uint32_t asked, unsigned char* t) {
+    unsigned char code[kDiEventsThunkBytes] = {
+        0x9C, 0x60,                              // pushfd / pushad
+        0x8B, 0x0D, 0, 0, 0, 0,                  // mov ecx, [dispatch]
+        0x85, 0xC9, 0x74, 0x13,                  // test ecx, ecx / jz done               nobody drives: the store alone
+        0xFF, 0xB3, 0, 0, 0, 0,                  // push [ebx+device]                     the device
+        0x68, 0, 0, 0, 0,                        // push asked                            the count the client asked for
+        0x55,                                    // push ebp                              the count
+        0x57,                                    // push edi                              the events
+        0x6A, 0x00,                              // push 0                                the read succeeded
+        0x6A, PADHOOK_DI_EVENTS,                 // push kind
+        0xFF, 0xD1,                              // call ecx                              __stdcall: pops its 6 arguments
+        0x61, 0x9D,                              // done: popad / popfd
+        0xC6, 0x44, 0x24, 0x17, 0x01,            // mov byte [esp+0x17], 1                the client's own store
+        0xC3,                                    // ret
+    };
+    auto const d = static_cast<std::uint32_t>(block);
+    std::memcpy(code + 4, &d, 4);
+    std::memcpy(code + 14, &device_disp, 4);
+    std::memcpy(code + 19, &asked, 4);
+#ifdef PADHOOK_FAULT_DI_NO_STORE
+    code[33] = code[34] = code[35] = code[36] = code[37] = 0x90;   // the client's flag is never set
+#endif
+    std::memcpy(t, code, kDiEventsThunkBytes);
+}
+
+// The 8 aligned bytes that hold the 5 at `at`, before (as found) and after the patch (E8 <rel32 -> thunk>).
+inline void di_patch_bytes(std::uintptr_t at, std::uintptr_t thunk, unsigned char const* found, unsigned char* want) {
+    std::size_t const k = at % 8;
+    std::memcpy(want, found, 8);
+    want[k] = 0xE8;
+    auto const rel = static_cast<std::int32_t>(thunk - (at + 5));
+    std::memcpy(want + k + 1, &rel, 4);
+}
+
+// One site: the aligned block read, checked to hold `expect` at `at`, and written in one locked compare-and-exchange.
+// write = false: the check alone. Null on success, or why not.
+inline char const* di_write_site(std::uintptr_t at, unsigned char const* expect, std::uintptr_t thunk, unsigned char* old_out,
+                                 bool write = true) {
+    std::uintptr_t const block = at & ~static_cast<std::uintptr_t>(7);
+    if (!di_fits_one_block(at)) return "are not on 8-byte boundaries that one write can patch";
+    unsigned char found[8];
+    std::memcpy(found, reinterpret_cast<void const*>(block), 8);
+    if (std::memcmp(found + (at - block), expect, 5) != 0) return kDiChanged;
+    if (old_out) std::memcpy(old_out, found, 8);
+    if (!write) return nullptr;
+    unsigned char want[8];
+    di_patch_bytes(at, thunk, found, want);
+    DWORD previous = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(block), 8, PAGE_EXECUTE_READWRITE, &previous))
+        return "could not be patched (VirtualProtect failed)";
+    LONGLONG old_v = 0, new_v = 0;
+    std::memcpy(&old_v, found, 8);
+    std::memcpy(&new_v, want, 8);
+    bool const wrote = InterlockedCompareExchange64(reinterpret_cast<LONGLONG volatile*>(block), new_v, old_v) == old_v;
+    VirtualProtect(reinterpret_cast<void*>(block), 8, previous, &previous);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(block), 8);
+    return wrote ? nullptr : kDiChanged;
+}
+
+// Put a site back as it was (only when the other site failed in the same install).
+inline void di_unwrite_site(std::uintptr_t at, unsigned char const* old_bytes) {
+    std::uintptr_t const block = at & ~static_cast<std::uintptr_t>(7);
+    unsigned char now[8];
+    std::memcpy(now, reinterpret_cast<void const*>(block), 8);
+    DWORD previous = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(block), 8, PAGE_EXECUTE_READWRITE, &previous)) return;
+    LONGLONG old_v = 0, new_v = 0;
+    std::memcpy(&old_v, now, 8);
+    std::memcpy(&new_v, old_bytes, 8);
+    InterlockedCompareExchange64(reinterpret_cast<LONGLONG volatile*>(block), new_v, old_v);
+    VirtualProtect(reinterpret_cast<void*>(block), 8, previous, &previous);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(block), 8);
+}
+
+// Patch both sites that the checks passed: the block, then the state site, then the event site (the state site goes
+// back if the event site fails). Null on success, with the hook's block, dispatch_ptr, sites and offsets set.
+inline char const* di_install(PadDiHook& h, DiScan const& s) {
+    auto* block = static_cast<unsigned char*>(VirtualAlloc(nullptr, kDiBlockBytes, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!block) return "could not be patched (no memory for the hook block)";
+    std::memset(block, 0xCC, kDiBlockBytes);
+    std::memset(block, 0, 4);
+    auto const b = reinterpret_cast<std::uintptr_t>(block);
+    di_state_thunk_bytes(b, s.state_disp, s.buffer_disp, block + kDiStateThunkAt);
+    di_events_thunk_bytes(b, s.events_disp, s.asked, block + kDiEventsThunkAt);
+    FlushInstructionCache(GetCurrentProcess(), block, kDiBlockBytes);
+    std::uintptr_t const at_state = s.state_at + kDiStateCmpAt, at_events = s.events_at + kDiEventsStoreAt;
+    h.block = block;
+    h.dispatch_ptr = reinterpret_cast<padhook_di_fn volatile*>(block);
+    h.site_state = at_state;
+    h.site_events = at_events;
+    h.device_disp = s.state_disp;
+    h.buffer_disp = s.buffer_disp;
+    MemoryBarrier();
+    auto clear = [&]() {
+        h.block = nullptr; h.dispatch_ptr = nullptr; h.site_state = h.site_events = 0; h.device_disp = h.buffer_disp = 0;
+    };
+    unsigned char old_state[8], old_events[8];
+    // both checked before either is written
+    char const* why = di_write_site(at_state, kDiCmp, b + kDiStateThunkAt, old_state, false);
+    if (!why) why = di_write_site(at_events, kDiStore, b + kDiEventsThunkAt, old_events, false);
+    if (!why) why = di_write_site(at_state, kDiCmp, b + kDiStateThunkAt, old_state);
+    if (why) {
+        clear();
+        VirtualFree(block, 0, MEM_RELEASE);
+        return why;
+    }
+    if ((why = di_write_site(at_events, kDiStore, b + kDiEventsThunkAt, old_events)) != nullptr) {
+        di_unwrite_site(at_state, old_state);
+        clear();                         // the block stays: a thread may be inside the state thunk now (nobody drives yet)
+        return why;
+    }
+    return nullptr;
+}
+
+// The scan over the client's code sections, done once per module (the client's code never changes).
+struct DiFind {
+    int state;                           // 0 not yet (the client module is not loaded), 1 found, 2 refused for good
+    DiScan scan;
+    char const* why;
+};
+inline DiFind& di_find() { static DiFind value = {0, {0, 0, 0, 0, 0, 0, 0, 0}, nullptr}; return value; }
+
+inline DiFind& find_di_sites() {
+    DiFind& f = di_find();
+    if (f.state != 0) return f;
+    DiScan s {0, 0, 0, 0, 0, 0, 0, 0};
+    HMODULE game = nullptr;
+    bool const headers = for_each_game_section(&game, [&](std::uintptr_t begin, std::uintptr_t end, DWORD flags) {
+        if (!(flags & IMAGE_SCN_MEM_EXECUTE)) return;
+        for_each_readable_run(begin, end, [&](unsigned char const* p, std::size_t n, std::uintptr_t at) {
+            di_scan_sites(p, n, at, s);
+        });
+    });
+    if (!game) { f.why = "were not looked for (" PADHOOK_GAME " is not loaded)"; return f; }
+    f.state = 2;
+    if (!headers) { f.why = "were not looked for (" PADHOOK_GAME "'s headers are unreadable)"; return f; }
+    f.scan = s;
+    f.why = di_scan_verdict(s);
+    if (!f.why) f.state = 1;
+    return f;
+}
+
+// Can this client drive the DirectInput source? (rev 4 or later, alive, its dispatcher in its own module)
+inline bool can_own_di(PadClient const& c) {
+    return c.rev >= 4 && c.di_dispatch && can_own(c) && code_in_module(reinterpret_cast<void const*>(c.di_dispatch), c.module);
+}
+
+inline void set_di_owner(PadBus* bus, int slot) {
+    PadDiHook& h = bus->di;
+    if (!h.dispatch_ptr) return;
+    padhook_di_fn const next = slot >= 0 ? bus->clients[slot].di_dispatch : nullptr;
+    // nobody drove: buttons went down and up unseen, so the next state read gives every held button to the game
+    if (*h.dispatch_ptr == nullptr && next) InterlockedExchange(&h.press.primed, 0);
+    if (*h.dispatch_ptr != next) InterlockedIncrement(&h.handovers);
+    *h.dispatch_ptr = next;
+    InterlockedExchange(&h.owner_rev, slot >= 0 ? static_cast<LONG>(bus->clients[slot].rev) : 0);
+    InterlockedExchange(&h.owner, slot + 1);
+}
+
+// The best client to drive the DirectInput source (the highest revision), other than `leaving`, or nobody.
+inline void reassign_di_owner(PadBus* bus, int leaving) {
+    if (!bus || !bus->di.dispatch_ptr) return;
+    int best = -1;
+    for (int i = 0; i < PADHOOK_MAX_CLIENTS; ++i) {
+        if (i == leaving || !can_own_di(bus->clients[i])) continue;
+        if (best < 0 || bus->clients[i].rev > bus->clients[best].rev) best = i;
+    }
+    set_di_owner(bus, best);
+}
+
+// Does the client in `slot` take the DirectInput dispatch? (nobody drives it, the driver is gone, or this revision is higher)
+inline void maybe_take_di(PadBus* bus, int slot) {
+    PadDiHook& h = bus->di;
+    if (!InterlockedCompareExchange(&h.installed, 0, 0) || !h.dispatch_ptr || !can_own_di(bus->clients[slot])) return;
+    LONG const owner = InterlockedCompareExchange(&h.owner, 0, 0) - 1;
+    bool take = owner < 0 || owner >= PADHOOK_MAX_CLIENTS;
+    if (!take) {
+        PadClient const& o = bus->clients[owner];
+        take = !can_own_di(o) || o.di_dispatch != *h.dispatch_ptr;
+    }
+    if (!take) take = static_cast<LONG>(PADHOOK_REV) > InterlockedCompareExchange(&h.owner_rev, 0, 0);
+    if (take) set_di_owner(bus, slot);
+}
+
 }  // namespace padhook_detail
 
 // Attach to the process-wide bus, creating it on first use (leaked on purpose: it belongs to the process).
@@ -1145,11 +1967,74 @@ inline bool padhook_ensure_hook(PadBus* bus, bool simulate_missing = false, char
     return done(false);
 }
 
+
+// rev 4: the DirectInput source's state: PADHOOK_LIVE (both sites patched), PADHOOK_WAIT (FFXiMain.dll is not loaded),
+// PADHOOK_BLOCKED (the sites cannot be patched safely in this process), or PADHOOK_NO_BUS.
+inline int padhook_di_state(PadBus const* bus) {
+    if (!bus) return PADHOOK_NO_BUS;
+    if (bus->di.installed) return PADHOOK_LIVE;
+    if (bus->di.blocked) return PADHOOK_BLOCKED;
+    return PADHOOK_WAIT;
+}
+
+// rev 4: patch the DirectInput sites if nobody has yet, and give the dispatch to the best live client. True when they
+// are live, whoever wrote them. False with bus->di.status saying why: retry later (PADHOOK_WAIT), or never in this
+// process (bus->di.blocked). simulate_missing: the not-found path, always.
+inline bool padhook_ensure_di(PadBus* bus, bool simulate_missing = false, char const* who = nullptr) {
+    using namespace padhook_detail;
+    if (!bus) return false;
+    PadDiHook& h = bus->di;
+    if (InterlockedCompareExchange(&h.installed, 0, 0) != 0) return true;
+    if (simulate_missing) {
+        if (InterlockedCompareExchange(&h.blocked, 0, 0) == 0)
+            std::snprintf(h.status, sizeof(h.status), "%s were not found (simulated)", PADHOOK_DI_SITES);
+        return false;
+    }
+    if (InterlockedCompareExchange(&h.install_lock, 1, 0) != 0) {
+        for (int spin = 0; spin < 2000 && InterlockedCompareExchange(&h.installed, 0, 0) == 0; ++spin) Sleep(1);
+        return InterlockedCompareExchange(&h.installed, 0, 0) != 0;
+    }
+    if (InterlockedCompareExchange(&h.installed, 0, 0) != 0) {    // patched between the first check and the lock
+        InterlockedExchange(&h.install_lock, 0);
+        return true;
+    }
+    if (InterlockedCompareExchange(&h.blocked, 0, 0) != 0) {      // refused before: the status says why
+        InterlockedExchange(&h.install_lock, 0);
+        return false;
+    }
+    char const* const who_s = who && *who ? who : "?";
+    DiFind& f = find_di_sites();
+    char const* why = f.why;
+    if (f.state == 1) {
+        why = di_install(h, f.scan);
+        if (why) { f.state = 2; f.why = why; }
+    }
+    if (!why) {
+        std::snprintf(h.status, sizeof(h.status), "hook installed at %s %08lX, %08lX by %s (rev %d)", PADHOOK_DI_SITES,
+                      static_cast<unsigned long>(h.site_state), static_cast<unsigned long>(h.site_events), who_s, PADHOOK_REV);
+        InterlockedIncrement(&h.installs);
+        InterlockedExchange(&h.installed, 1);
+        InterlockedExchange(&h.install_lock, 0);
+        reg_lock(bus, true);
+        reassign_di_owner(bus, -1);                   // a rev 4 client already on the bus drives it at once
+        reg_unlock(bus);
+        return true;
+    }
+    std::snprintf(h.status, sizeof(h.status), "%s %s", PADHOOK_DI_SITES, why);
+    if (f.state == 2) InterlockedExchange(&h.blocked, 1);
+    InterlockedExchange(&h.install_lock, 0);
+    return false;
+}
+
 // A slot index, or -1. The dispatch goes to this module when nobody drives it, when its revision is
-// higher than the driver's, or when the driver's dispatcher is no longer mapped.
+// higher than the driver's, or when the driver's dispatcher is no longer mapped. Rev 4: the same for the DirectInput
+// dispatch, and a client may join while only the DirectInput source is live.
 inline int padhook_register(PadBus* bus, char const* name = nullptr) {
     using namespace padhook_detail;
-    if (!bus || !bus->dispatch_ptr || !InterlockedCompareExchange(&bus->hook_installed, 0, 0)) return -1;
+    if (!bus) return -1;
+    bool const xin = bus->dispatch_ptr && InterlockedCompareExchange(&bus->hook_installed, 0, 0);
+    bool const din = bus->di.dispatch_ptr && InterlockedCompareExchange(&bus->di.installed, 0, 0);
+    if (!xin && !din) return -1;
     HMODULE const self = self_module();
     volatile LONG& nonce = module_nonce();
     while (nonce == 0) {
@@ -1164,6 +2049,8 @@ inline int padhook_register(PadBus* bus, char const* name = nullptr) {
         PadClient& c = bus->clients[i];
         c.capture = 0;
         c.chord = 0;
+        c.di_chord = 0;
+        c.di_dispatch = &di_dispatch;
         c.alive_tick = static_cast<LONG>(GetTickCount());
         c.dispatch = &dispatch;
         c.rev = PADHOOK_REV;
@@ -1177,7 +2064,7 @@ inline int padhook_register(PadBus* bus, char const* name = nullptr) {
         slot = i;
         break;
     }
-    if (slot >= 0) {
+    if (slot >= 0 && xin) {
         LONG const owner = InterlockedCompareExchange(&bus->owner_slot, 0, 0);
         bool take = owner < 0 || owner >= PADHOOK_MAX_CLIENTS;
         if (!take) {
@@ -1187,6 +2074,7 @@ inline int padhook_register(PadBus* bus, char const* name = nullptr) {
         if (!take) take = static_cast<LONG>(PADHOOK_REV) > InterlockedCompareExchange(&bus->owner_rev, 0, 0);
         if (take) set_owner(bus, slot);
     }
+    if (slot >= 0) maybe_take_di(bus, slot);
     reg_unlock(bus);
     return slot;
 }
@@ -1201,23 +2089,35 @@ inline void padhook_unregister(PadBus* bus, int slot, bool may_wait) {
     InterlockedExchange(&c.capture, 0);
     bool const drove = InterlockedCompareExchange(&bus->owner_slot, 0, 0) == slot;
     if (drove) reassign_owner(bus, slot);
+    bool const drove_di = InterlockedCompareExchange(&bus->di.owner, 0, 0) == slot + 1;   // rev 4
+    if (drove_di) reassign_di_owner(bus, slot);
     LONG const handed_at = InterlockedCompareExchange(&bus->calls, 0, 0);
+    LONG const di_handed_at = InterlockedCompareExchange(&bus->di.calls, 0, 0);
     clear_client(c);
     reg_unlock(bus);
     if (may_wait) {
-        for (int spin = 0; spin < 200 && InterlockedCompareExchange(&bus->in_flight, 0, 0) != 0; ++spin) Sleep(1);
-        if (drove && last_dispatch_tid() != GetCurrentThreadId()) {
+        for (int spin = 0; spin < 200 && (InterlockedCompareExchange(&bus->in_flight, 0, 0) != 0
+                                          || InterlockedCompareExchange(&bus->di.in_flight, 0, 0) != 0); ++spin) Sleep(1);
+        bool const wait_x = drove && last_dispatch_tid() != GetCurrentThreadId();
+        bool const wait_d = drove_di && last_di_tid() != GetCurrentThreadId();
+        if (wait_x || wait_d) {
             DWORD const t0 = GetTickCount();
-            while (InterlockedCompareExchange(&bus->calls, 0, 0) - handed_at < 2 && GetTickCount() - t0 < PADHOOK_DRAIN_MS) Sleep(1);
+            while (((wait_x && InterlockedCompareExchange(&bus->calls, 0, 0) - handed_at < 2)
+                    || (wait_d && InterlockedCompareExchange(&bus->di.calls, 0, 0) - di_handed_at < 2))
+                   && GetTickCount() - t0 < PADHOOK_DRAIN_MS) Sleep(1);
         }
     }
 }
 
-// Patch if nobody has, then register. A slot >= 0, or a PADHOOK_JOIN_* code.
+// Patch if nobody has, then register. A slot >= 0, or a PADHOOK_JOIN_* code. Rev 4: the DirectInput sites too, and
+// the join succeeds while either source is live; it is blocked only when both are.
 inline int padhook_join(PadBus* bus, char const* name = nullptr, bool simulate_missing = false) {
     if (!bus) return PADHOOK_JOIN_NO_BUS;
-    if (!padhook_ensure_hook(bus, simulate_missing, name))
-        return padhook_state(bus) == PADHOOK_BLOCKED ? PADHOOK_JOIN_BLOCKED : PADHOOK_JOIN_RETRY;
+    bool const xin = padhook_ensure_hook(bus, simulate_missing, name);
+    bool const din = padhook_ensure_di(bus, simulate_missing, name);
+    if (!xin && !din)
+        return padhook_state(bus) == PADHOOK_BLOCKED && padhook_di_state(bus) == PADHOOK_BLOCKED ? PADHOOK_JOIN_BLOCKED
+                                                                                                 : PADHOOK_JOIN_RETRY;
     int const slot = padhook_register(bus, name);
     return slot >= 0 ? slot : PADHOOK_JOIN_FULL;
 }
@@ -1312,6 +2212,61 @@ inline void padhook_describe(PadBus const* bus, char* out, std::size_t n) {
             static_cast<unsigned long>(c.rev), drives && holds ? " (drives, holds)" : drives ? " (drives)" : holds ? " (holds)" : ""));
         sep = ", ";
     }
+}
+
+// rev 4: the DirectInput buttons that take this client's pad together (bit i: button i; 0: none). The hook keeps that
+// chord from the game as it keeps the XInput one (padhook_chord); the client still sees it raw, and takes the pad itself.
+inline void padhook_di_chord(PadBus* bus, int slot, unsigned long buttons) {
+    if (!bus || slot < 0 || slot >= PADHOOK_MAX_CLIENTS) return;
+    PadClient& c = bus->clients[slot];
+    if (c.dispatch != &padhook_detail::dispatch) return;
+    c.di_chord = buttons;
+    MemoryBarrier();
+}
+
+// rev 4: a consistent copy of what the game last read from its DirectInput pad (false while a write keeps it torn after a
+// few tries).
+inline bool padhook_di_read(PadBus const* bus, PadDiState* out) {
+    if (!bus || !out) return false;
+    PadDiHook const& h = bus->di;
+    for (int tries = 0; tries < 8; ++tries) {
+        LONG const a = h.wseq;
+        if (a & 1) { YieldProcessor(); continue; }
+        MemoryBarrier();
+        std::memcpy(out, const_cast<PadDiState const*>(&h.pad), sizeof(PadDiState));
+        MemoryBarrier();
+        if (h.wseq == a) return true;
+    }
+    return false;
+}
+
+// rev 4: one line for a status display, e.g.
+//   "live at FFXiMain's DirectInput pad reads 1000619A, 100069E3; driven by chronicle r4"
+//   "blocked: FFXiMain's DirectInput pad reads were not found: no GetDeviceState read of the pad (a client update?)"
+inline void padhook_di_describe(PadBus const* bus, char* out, std::size_t n) {
+    if (!out || n == 0) return;
+    out[0] = 0;
+    int const st = padhook_di_state(bus);
+    if (st == PADHOOK_NO_BUS) { std::snprintf(out, n, "no bus"); return; }
+    PadDiHook const& h = bus->di;
+    if (st != PADHOOK_LIVE) {
+        std::snprintf(out, n, "%s: %s", st == PADHOOK_BLOCKED ? "blocked" : "waiting",
+                      h.status[0] ? h.status : PADHOOK_DI_SITES " were not looked for yet");
+        return;
+    }
+    LONG const owner = h.owner - 1;
+    char nm[17] = "nobody";
+    unsigned long rev = 0;
+    if (owner >= 0 && owner < PADHOOK_MAX_CLIENTS && bus->clients[owner].occupied == 2) {
+        std::memcpy(nm, bus->clients[owner].name, 16);
+        nm[16] = 0;
+        if (!nm[0]) std::snprintf(nm, sizeof(nm), "?");
+        rev = bus->clients[owner].rev;
+    }
+    if (rev) std::snprintf(out, n, "live at %s %08lX, %08lX; driven by %s r%lu", PADHOOK_DI_SITES,
+                           static_cast<unsigned long>(h.site_state), static_cast<unsigned long>(h.site_events), nm, rev);
+    else std::snprintf(out, n, "live at %s %08lX, %08lX; nobody drives it", PADHOOK_DI_SITES,
+                       static_cast<unsigned long>(h.site_state), static_cast<unsigned long>(h.site_events));
 }
 
 #endif  // PADHOOK_H

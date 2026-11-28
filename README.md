@@ -442,6 +442,7 @@ The Lua module table is documented in [docs/lua-api.md](docs/lua-api.md), the dr
 | `wintype(n)` / `wtread()` | the window style, 1 to 8 |
 | `status()` / `prof()` / `us()` | state, counters, a microsecond clock |
 | `pad_start()` / `pad()` / `pad_capture(on)` | the controller: read it, hold it (1.3.0) |
+| `pad_dinput()` | the DirectInput controller, read it (1.8.0) |
 | `key_start()` / `key_hide(code, ...)` | keep single keys from the game (1.6.0) |
 | `key_bindings()` | the client's keyboard bindings, read only (1.7.0) |
 
@@ -455,7 +456,9 @@ Windower API offers it: `pad()` reads the pad the game reads, and `pad_capture(t
 presses from the game while the addon uses them. It is one shared hook, as fail closed as the drawing
 hook. Since 1.5.0 it patches the client's own XInput wrapper in `FFXiMain.dll`, which works with every
 build of `xinput1_3.dll`. Where that wrapper is not found, it falls back to a hot patch of
-`xinput1_3.dll!XInputGetState`. See [docs/lua-api.md](docs/lua-api.md#the-controller-130) and
+`xinput1_3.dll!XInputGetState`. Since 1.8.0 it also patches the client's two DirectInput pad reads.
+The game reads a DirectInput pad with Enable XInput off, or for a pad such as a DualShock without
+Steam Input. See [docs/lua-api.md](docs/lua-api.md#the-controller-130) and
 [docs/abi.md](docs/abi.md#padhook-1).
 
 The **keyboard** (1.6.0) is the other input nui takes. Windower's `keyboard` event sees every key but
@@ -534,9 +537,10 @@ atlas, frame recipe and glyphs. CI runs it on every pull request.
 The controller hook has two suites of its own, and neither needs game files.
 `sh test/pad_linux/run.sh --self-test` needs only g++ with 32-bit support (`g++-multilib`). It runs
 the mask, the chord and the client's real XInput wrapper bytes through the patch, with the stack
-checked on every call. CI runs it on every pull request. `sh test/build_pad_test.sh --self-test`
-builds Windows exes with stand-ins for the client, its shim and `xinput1_3.dll`. CI builds them,
-but they must run on Windows.
+checked on every call. It also runs the DirectInput press rules, and the client's real DirectInput
+read bytes through their patches. CI runs it on every pull request. `sh test/build_pad_test.sh
+--self-test` builds Windows exes with stand-ins for the client, its shim and `xinput1_3.dll`, and a
+stand-in client with both DirectInput reads. CI builds them, but they must run on Windows.
 
 The keyboard hook has two as well. `sh test/key_linux/run.sh --self-test` runs the press rules. It
 also runs the client's real keyboard read bytes through the patch, and it checks the stack, the

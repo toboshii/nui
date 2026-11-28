@@ -2084,6 +2084,7 @@ int host_open(lua_State* L, HostConfig const& cfg, HostFn const* extra, int n_ex
                                  {"prof", guarded<l_prof>}, {"us", guarded<l_us>},
                                  // 1.3.0: the controller (pad.hpp)
                                  {"pad_start", guarded<l_pad_start>}, {"pad", guarded<l_pad>},
+                                 {"pad_dinput", guarded<l_pad_dinput>},     // 1.8.0
                                  {"pad_capture", guarded<l_pad_capture>}, {"pad_chord", guarded<l_pad_chord>},
                                  {"pad_config", guarded<l_pad_config>},
                                  {"pad_status", guarded<l_pad_status>}, {"pad_stop", guarded<l_pad_stop>},

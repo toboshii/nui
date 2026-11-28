@@ -88,7 +88,8 @@ roughly 12 MiB when it holds its own.
 ## PadHook 1
 
 `Local\FFXiPadHook_v1_<pid>`, 4,096 bytes, mapped whole. Added in nui 1.3.0
-(`src/PadHook/PadHook.h`, frozen as `test/frozen/layout_padhook.1.3.0.txt`).
+(`src/PadHook/PadHook.h`, frozen as `test/frozen/layout_padhook.1.3.0.txt`). Revision 4 (nui 1.8.0)
+appends the DirectInput source after `PadBus::status`.
 
 With its **Enable XInput** setting on, the client reads the pad every frame. It does not call
 Microsoft's DLL directly. It loads its own shim, `xinputdll.dll`, from the game folder, and the shim
@@ -167,9 +168,61 @@ On a bus that a revision 1 or 2 module patched, the field is zero, which is rout
 - **A hold needs a heartbeat.** A client that has not renewed its hold for 250 ms (`pad()` renews it)
   no longer holds the pad. An addon that errors or stops polling can never leave the player without a
   controller.
-- **Designed for a second source.** `PadState::source` says where a state came from (`xinput`, and
-  `dinput` reserved), and the mask works on one button word in XInput's layout with the triggers as
-  two more bits. A DirectInput hook in a later revision adds a source, not a new contract.
+- **A second source.** `PadState::source` says where a state came from. Revision 4 adds the
+  DirectInput source below on the same bus, with its own part of the mapping.
+
+### The DirectInput source (revision 4, nui 1.8.0)
+
+The client reads exactly one pad. It reads XInput when Enable XInput is on and the pad is an XInput
+device. Otherwise it reads a DirectInput device: with Enable XInput off, or for a pad that is not an
+XInput device, such as a DualShock without Steam Input. Revision 4 hooks that read too.
+
+- **The read.** The client's input update reads the pad once per tick, on the main thread, with two
+  calls. `GetDeviceState` fills a 272-byte `DIJOYSTATE2`. Then `GetDeviceData` returns up to 16
+  buffered events. The client takes each button's state from the first read, and its press and
+  release edges from the events. Its pad config (`padsin000`) maps buttons 0 to 31 to game actions.
+  It reads the sticks, the two sliders and POV 0 from the state, ranged -127 to 127.
+- **Two patches.** Each changes one whole 5-byte instruction into `call thunk`, in one locked 8-byte
+  compare-and-exchange. The first is the `cmp eax, 0x800700AA` after `GetDeviceState`, as in KeyHook.
+  After the event read comes `test eax, eax`, too short for a call. So the second patch is the
+  client's store `mov byte [esp+0x13], 1` on the read's success branch. That branch is the only way
+  to the store, and the client reads the events only after it. Its thunk makes the
+  store itself.
+- **Found by signature, never by address.** Each signature (52 and 100 bytes) must match exactly once
+  in `FFXiMain.dll`'s code. Both reads must load the device from the same offset. The event read must
+  follow the state read within 4 KB. Each patched instruction must lie in one aligned 8-byte block.
+  Otherwise nothing is patched, for good in this process, and `pad_status().di_describe` says why.
+  In the 2026-11-02 build the device is at `input+0x90`, and the patches are at `1000619A` and
+  `10006A0B`.
+- **The press rules** are KeyHook's and PadHook's, on both reads, one record per button:
+  - The hook decides a new press once, at the first read that shows it.
+  - While any live client holds the pad, the hook hides a new press. It clears the press's state byte
+    and drops its press and release events.
+  - A press the game saw stays the game's until its release.
+  - A hidden press stays hidden until its release, also after the client gives the pad back.
+  - While a client holds the pad, every stick and slider reads 0, the client's centre. POV 0 reads
+    centred, unless the game already had the POV held.
+  - A lost release ends a press once the state shows the button up and an event read returns fewer
+    events than asked.
+  - When a module starts to drive after nobody did, every button held at its first state read is the
+    game's.
+- **The chord.** A client names its chord a second time, as DirectInput buttons
+  (`pad_chord(buttons, di_buttons)`). A chord button is held back for up to 150 ms, as on XInput. If
+  its partner comes in time, the game never sees either button. If it is released alone in time, the
+  game gets a press event and a release event. If it is held alone too long, the game gets a press
+  event then. The client takes edges only from events, so a tap goes back to the game as events.
+  The hook never writes more events than the client asked for. What does not fit waits for the next
+  read.
+- **The device's maker.** Once per device, the dispatcher calls the device's own `GetDeviceInfo`.
+  When `guidProduct` is a HID product id, the USB vendor and product ids go into the bus, with the
+  product name. An addon can then tell a PlayStation pad from an Xbox pad, whose buttons are numbered
+  differently.
+- **Its own dispatch.** `PadBus::di` holds the patch, the dispatch, the raw state behind its own
+  seqlock, the press record and its status. The live revision 4 client with the highest revision
+  drives it. A module hands it on in `DllMain`, as for XInput. A module below revision 4 never
+  touches `PadBus::di`, but its hold counts for the DirectInput pad too.
+- **The join.** `pad_start()` patches both sources. It succeeds while either one is live, and it is
+  refused for good only when both are.
 
 ## KeyHook 1
 

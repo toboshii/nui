@@ -4,7 +4,7 @@
 //   pad_test.exe main <layout_padhook.txt>   route 0 on pad_fake_xinput.dll (the real hot-patchable entry
 //                                            shape), with no client module loaded: the patch bytes,
 //                                            pass-through, recording, the mask rules, renumbering, the
-//                                            heartbeat, the chord, a revision 4 module (pad_mod.cpp) taking
+//                                            heartbeat, the chord, a revision 5 module (pad_mod.cpp) taking
 //                                            the dispatch and handing it back from its DllMain, the layout
 //   pad_test.exe nomatch                     a client module whose wrapper the signature does not match:
 //                                            route 0 on pad_fake_xinput.dll, and the status says why
@@ -78,7 +78,7 @@ template <typename T> T fn_of(HMODULE m, char const* name) {
 bool has(char const* text, char const* part) { return std::strstr(text, part) != nullptr; }
 
 // Everything that does not depend on the route: pass-through, recording, the mask, renumbering, the
-// heartbeat, the chord, a revision 4 module taking the dispatch and handing it back. Reads go through
+// heartbeat, the chord, a revision 5 module taking the dispatch and handing it back. Reads go through
 // read(), which is the export (route 0) or the client's wrapper (route 1).
 void shared_checks(PadBus* bus, int slot) {
     // pass-through and recording
@@ -190,28 +190,28 @@ void shared_checks(PadBus* bus, int slot) {
         press(0);
     }
 
-    // a second module at revision 4 takes the dispatch; its DllMain hands it back
-    HMODULE m2 = LoadLibraryA("pad_mod_r4.dll");
-    check("module r4 loads", m2 != nullptr);
+    // a second module at revision 5 takes the dispatch; its DllMain hands it back
+    HMODULE m2 = LoadLibraryA("pad_mod_r5.dll");
+    check("module r5 loads", m2 != nullptr);
     if (m2) {
         auto mjoin = fn_of<join_fn>(m2, "mod_join");
         auto mcap = fn_of<cap_fn>(m2, "mod_capture");
         auto mdis = fn_of<ptr_fn>(m2, "mod_dispatch");
         int const s2 = mjoin ? mjoin() : -1;
-        check("r4 joins", s2 >= 0 && s2 != slot);
-        check("r4 drives", bus->owner_slot == s2 && reinterpret_cast<void*>(*bus->dispatch_ptr) == mdis());
+        check("r5 joins", s2 >= 0 && s2 != slot);
+        check("r5 drives", bus->owner_slot == s2 && reinterpret_cast<void*>(*bus->dispatch_ptr) == mdis());
         check("no second install", bus->installs == 1);
         s = press(A);
-        check("r4 dispatches", s.buttons == A);
+        check("r5 dispatches", s.buttons == A);
         mcap(1);
         s = press(A | B);
-        check("r4's capture hides for everyone", (s.buttons & B) == 0 && (s.buttons & A) != 0);
+        check("r5's capture hides for everyone", (s.buttons & B) == 0 && (s.buttons & A) != 0);
         press(0);
         FreeLibrary(m2);
-        check("r4 left: the dispatch is back with A", bus->owner_slot == slot && *bus->dispatch_ptr == &padhook_detail::dispatch);
+        check("r5 left: the dispatch is back with A", bus->owner_slot == slot && *bus->dispatch_ptr == &padhook_detail::dispatch);
         s = press(A);
-        check("after r4 unloaded: reads still work", s.buttons == A, "");
-        check("r4's capture went with it", s.buttons == A);
+        check("after r5 unloaded: reads still work", s.buttons == A, "");
+        check("r5's capture went with it", s.buttons == A);
         press(0);
     }
 }
@@ -279,7 +279,7 @@ int run_main(char const* layout_path) {
     check("live", padhook_state(bus) == PADHOOK_LIVE);
     check("drives", bus->owner_slot == slot && *bus->dispatch_ptr == &padhook_detail::dispatch);
     check("one install", bus->installs == 1);
-    check("status: route 0 by name", has(bus->status, "!XInputGetState") && has(bus->status, "(rev 3)"), bus->status);
+    check("status: route 0 by name", has(bus->status, "!XInputGetState") && has(bus->status, "(rev 4)"), bus->status);
     char line[256];
     padhook_describe(bus, line, sizeof(line));
     check("describe: route 0", has(line, "live at " PADHOOK_DLL "!XInputGetState") && has(line, "1 client: test r3 (drives)"), line);
@@ -461,7 +461,7 @@ int run_wrapper() {
     check("patched: H kept", padhook_detail::le32(wrapper + 1) == reinterpret_cast<std::uintptr_t>(&slots[0]));
     check("original is the adapter", reinterpret_cast<std::uintptr_t>(bus->original) == block + padhook_detail::kAdapterAt);
     check("the export untouched", std::memcmp(entry_before, entry - 5, 7) == 0);
-    check("status", has(bus->status, "hook installed at FFXiMain's XInput wrapper") && has(bus->status, "(rev 3)"), bus->status);
+    check("status", has(bus->status, "hook installed at FFXiMain's XInput wrapper") && has(bus->status, "(rev 4)"), bus->status);
     char line[256];
     padhook_describe(bus, line, sizeof(line));
     check("describe: not loaded yet", has(line, "live at FFXiMain's XInput wrapper") && has(line, "has not loaded xinputdll.dll yet"), line);

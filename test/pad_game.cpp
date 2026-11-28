@@ -8,6 +8,7 @@
 // The exports do what the client does: game_setup loads xinputdll.dll and writes all four slots (at input
 // init and on each re-enumeration), game_unload frees it and zeros only H, and game_read calls the wrapper
 // as the game does. game_point puts another of the shim's functions into F (a reload that moved it).
+// With -DGAME_DI it also holds the client's two DirectInput pad reads (PadHook rev 4, below).
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -58,5 +59,68 @@ extern "C" __declspec(dllexport) void __cdecl game_point(int alt) {
 
 extern "C" __declspec(dllexport) void* __cdecl game_wrapper() { return reinterpret_cast<void*>(&getstate_wrapper); }
 extern "C" __declspec(dllexport) volatile DWORD* __cdecl game_slots() { return g_slots; }
+
+#ifdef GAME_DI
+// PadHook rev 4: the client's input update, cut to its two DirectInput pad reads (2026-11-02, 1000616B and 100069AC),
+// byte for byte at the client's 8-byte alignment (the cmp at 8n+2, the store at 8n+3). Only the bytes that name addresses
+// differ: they point into this DLL. game_di_update(input) runs it as the client does; recorders after the cmp and after
+// the store keep the flags, eax and the client's flag for pad_di_test.exe. Built with -DGAME_DI_NOMATCH, the event read
+// calls another method, so the signature finds no event read (a client update).
+extern "C" {
+__attribute__((used)) volatile DWORD g_di_rec[6] = {0, 0, 0, 0, 0, 0};   // flags after the cmp, eax, flag, failed, ebp, edi
+__attribute__((used)) volatile unsigned char g_di_gamepad = 1;
+__attribute__((used)) volatile DWORD g_di_sink[2] = {0, 0};
+}
+#ifndef GAME_DI_NOMATCH
+#define DI_READ ".byte 0xFF,0x52,0x28\n"                      // call [edx+0x28]: GetDeviceData
+#else
+#define DI_READ ".byte 0xFF,0x52,0x2C\n"                      // call [edx+0x2C]: another method
+#endif
+asm(".text\n.balign 16\n"
+    ".globl _game_di_update\n"
+    "_game_di_update:\n"
+    "pushl %ebp\npushl %ebx\npushl %esi\npushl %edi\n"
+    "subl $0x60, %esp\n"
+    "movl 0x74(%esp), %ebx\n"
+    "movl 0x90(%ebx), %eax\n"
+    "testl %eax, %eax\n"
+    "jz 3f\n"
+    ".balign 8, 0x90\n.byte 0x90,0x90,0x90\n"
+    ".globl _game_di_site_a\n_game_di_site_a:\n"
+    ".byte 0x8A,0x8B,0x98,0x0C,0x00,0x00,0x84,0xC9,0x74,0x06,0x8B,0x08,0x50,0xFF,0x51,0x64,0x8B,0xCB,0xE8\n"
+    ".long 8f - . - 4\n"
+    ".byte 0x8B,0x83,0x90,0x00,0x00,0x00,0x8D,0x8B,0x44,0x0A,0x00,0x00,0x51,0x68,0x10,0x01,0x00,0x00\n"
+    ".byte 0x8B,0x10,0x50,0xFF,0x52,0x24,0x3D,0xAA,0x00,0x07,0x80\n"
+    "pushfl\npopl _g_di_rec\nmovl %eax, _g_di_rec+4\n"
+    "3:\n"
+    "movb $0, 0x13(%esp)\n"
+    ".balign 8, 0x90\n.byte 0x90,0x90,0x90,0x90\n"
+    ".globl _game_di_site_b\n_game_di_site_b:\n"
+    ".byte 0x8D,0xAB,0x94,0x0C,0x00,0x00,0xC7,0x45,0x00,0x10,0x00,0x00,0x00,0xA0\n"
+    ".long _g_di_gamepad\n"
+    ".byte 0x84,0xC0,0x0F,0x84\n.long 9f - . - 4\n"
+    ".byte 0x8B,0x83,0x90,0x00,0x00,0x00,0x85,0xC0,0x0F,0x84\n.long 9f - . - 4\n"
+    ".byte 0x8B,0x10,0x8D,0xBB,0x54,0x0B,0x00,0x00,0x6A,0x00,0x55,0x57,0x6A,0x14,0x50\n"
+    DI_READ
+    ".byte 0x85,0xC0,0x74,0x15,0xB9,0x50,0x00,0x00,0x00,0x33,0xC0,0xC7,0x45,0x00,0x00,0x00,0x00,0x00,0xF3,0xAB,0xE9\n"
+    ".long 7f - . - 4\n"
+    ".byte 0xA1\n.long _g_di_sink\n"
+    ".byte 0xC6,0x05\n.long _g_di_sink+4\n.byte 0x00\n"
+    ".byte 0xC6,0x44,0x24,0x13,0x01\n"
+    "movzbl 0x13(%esp), %eax\nmovl %eax, _g_di_rec+8\n"
+    "movl %ebp, _g_di_rec+16\nmovl %edi, _g_di_rec+20\n"
+    "jmp 9f\n"
+    "7:\nmovl $1, _g_di_rec+12\n"
+    "9:\n"
+    "addl $0x60, %esp\npopl %edi\npopl %esi\npopl %ebx\npopl %ebp\nret\n"
+    "8:\nret\n");
+extern "C" void game_di_update(void* input);
+extern "C" char game_di_site_a[], game_di_site_b[];
+extern "C" __declspec(dllexport) void __cdecl game_di(void* input) { game_di_update(input); }
+extern "C" __declspec(dllexport) void* __cdecl game_di_fn() { return reinterpret_cast<void*>(&game_di_update); }
+extern "C" __declspec(dllexport) void* __cdecl game_di_sites(int which) { return which ? game_di_site_b : game_di_site_a; }
+extern "C" __declspec(dllexport) volatile DWORD* __cdecl game_di_rec() { return g_di_rec; }
+extern "C" __declspec(dllexport) void __cdecl game_di_gamepad(int on) { g_di_gamepad = on ? 1 : 0; }
+#endif
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }

@@ -132,9 +132,13 @@ these.
 nui can read the pad the game reads, and keep presses from the game while the addon uses them. It
 hooks the client's XInput read once per process, shared by every nui module (PadHook 1, see
 [abi.md](abi.md)). Since 1.5.0 the hook patches the client's own XInput wrapper in `FFXiMain.dll`.
-Where that wrapper is not found, it hot-patches `xinput1_3.dll!XInputGetState` instead. Only XInput is
-read in this version. With the client's **Enable XInput** setting off, the game uses DirectInput, and
-`pad()` never sees a pad.
+Where that wrapper is not found, it hot-patches `xinput1_3.dll!XInputGetState` instead.
+
+Since 1.8.0 the hook also reads the client's DirectInput pad. The game reads one pad. It uses XInput
+when its **Enable XInput** setting is on and the pad is an XInput device. Otherwise it reads a
+DirectInput device: with the setting off, or for a pad such as a DualShock without Steam Input.
+`pad()` returns the XInput pad, and `pad_dinput()` the DirectInput pad. The hold and the heartbeat
+are the same for both.
 
 ### `pad_start([flags]) -> ok, msg [, retry_ms]`
 
@@ -178,6 +182,30 @@ the game, even when the game maps those buttons itself. You still see it raw in 
 `pad_capture(true)` yourself. A chord button pressed alone reaches the game up to 150 ms late, and
 a tap of one still reaches it. `0` turns the chord off.
 
+Since 1.8.0, `pad_chord(buttons, di_buttons)` also names the chord as DirectInput buttons: bit `i` is
+button `i`, so `0xC00` is buttons 10 and 11 (L3 and R3 on a PlayStation pad). DirectInput pads number
+their buttons differently by maker, so the addon chooses the bits. The hook keeps that chord from the
+game in the same way. A tap of one chord button goes back to the game as a press event and a release
+event.
+
+### `pad_dinput() -> seq, buttons, pov, x, y, z, rx, ry, rz, slider0, slider1, connected, holding, vendor, product` (1.8.0)
+
+The DirectInput pad the game last read, raw (before any mask). Returns numbers, not a table.
+
+| Value | What |
+|---|---|
+| `seq` | changes with every change of the rest; 0 = nothing read yet; -1 = the read was torn (try next frame) |
+| `buttons` | bit `i` held: button `i`, 0 to 31 (the buttons the client maps) |
+| `pov` | POV 0 in hundredths of a degree, clockwise from up (0, 9000, 18000, 27000); -1 = centred |
+| `x` .. `slider1` | -127 to 127, as the client ranges them. `y` is positive down |
+| `connected` | the client read the pad in the last second, and the read succeeded |
+| `holding` | this module holds the pad |
+| `vendor`, `product` | the pad's USB ids (`0x054C` Sony, `0x045E` Microsoft, `0x057E` Nintendo); 0 when not known |
+
+Which axis is which stick depends on the pad. A PlayStation pad has its right stick on `z` and `rz`.
+An Xbox pad read through DirectInput has it on `rx` and `ry`, and both triggers on `z`. Each call is
+also the hold's heartbeat, as `pad()` is.
+
 ### `pad_config() -> {key, padmode, padsin}` or `nil, why`
 
 The game's own pad settings, read from the registry, as the client's config tool writes them:
@@ -199,6 +227,20 @@ Since 1.5.0 it also has:
 
 `site` is the patched address: the wrapper on `wrapper`, the function on `export`. `describe` names the
 route, for example `live at FFXiMain's XInput wrapper 10008EA0; 1 client: chronicle r3 (drives)`.
+
+Since 1.8.0 it also has the DirectInput source:
+
+| Field | What |
+|---|---|
+| `di_state` | `live`, `waiting` (the client module is not loaded) or `blocked` |
+| `di_describe` | one line, for example `live at FFXiMain's DirectInput pad reads 1000619A, 10006A0B; driven by chronicle r4`, or why it is blocked |
+| `di_connected` | the client read a DirectInput pad in the last second |
+| `di_name`, `di_vendor`, `di_product` | the pad's product name and USB ids (0 when not known) |
+| `di_reads`, `di_calls` | state reads recorded, and reads through the hook |
+| `di_chord` | the DirectInput chord the hook keeps from the game (every client's) |
+| `di_masked`, `di_hidden`, `di_injected`, `di_chords` | buttons hidden now, presses hidden ever, taps given back as events ever, chords kept ever |
+
+When `pad_start()` fails, `msg` names the reasons of both sources.
 
 ### `pad_stop()`
 

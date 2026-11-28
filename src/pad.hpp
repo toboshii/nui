@@ -14,8 +14,15 @@
 //   pad_chord(buttons)                           (1.4.0) the buttons that take the pad together (e.g. L3 + R3:
 //        0xC0); the hook keeps that chord from the game, even where the game maps those buttons itself.
 //        A chord button pressed alone reaches the game up to 150 ms late; tapped alone, it still does.
+//   pad_chord(buttons, di_buttons)               (1.8.0) the same chord as DirectInput buttons (bit i: button i), for
+//        a game that reads a DirectInput pad: the hook keeps it from the game the same way.
+//   pad_dinput() -> seq, buttons, pov, x, y, z, rx, ry, rz, slider0, slider1, connected, holding, vendor, product
+//        (1.8.0) the DirectInput pad the game reads, raw: buttons 0..31 as bits, pov in hundredths of a degree (-1:
+//        centred), the axes -127..127 as the client ranges them, connected when the client read it in the last second,
+//        and the device's USB vendor and product ids (0: not known). Each call is also the heartbeat. nil when not started.
 //   pad_config() -> {key, padmode, padsin} | nil, why   the game's own pad settings (registry, read only)
 //   pad_status() -> table                        state, describe, calls, clients, holding, masked, hidden, lapses, ...
+//        (1.8.0) di_state, di_describe, di_name, di_vendor, di_product, di_connected, di_reads, di_hidden, ...
 //   pad_stop()                                   leave the hook (also done by stop() and in DllMain)
 #pragma once
 #include "luaapi.hpp"
@@ -28,6 +35,7 @@ void pad_release();                       // stop(): give the pad back and leave
 
 int __cdecl l_pad_start(lua_State* L);
 int __cdecl l_pad(lua_State* L);
+int __cdecl l_pad_dinput(lua_State* L);
 int __cdecl l_pad_capture(lua_State* L);
 int __cdecl l_pad_chord(lua_State* L);
 int __cdecl l_pad_config(lua_State* L);

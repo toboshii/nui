@@ -78,7 +78,11 @@ int __cdecl l_pad_start(lua_State* L) {
         return 2;
     }
     L_.pushboolean(L, 0);
-    L_.pushstring(L, r == PADHOOK_JOIN_NO_BUS ? "pad bus unavailable" : (r == PADHOOK_JOIN_FULL ? "pad bus full" : g_pbus->status));
+    char why[400];
+    if (r == PADHOOK_JOIN_NO_BUS) std::snprintf(why, sizeof(why), "pad bus unavailable");
+    else if (r == PADHOOK_JOIN_FULL) std::snprintf(why, sizeof(why), "pad bus full");
+    else std::snprintf(why, sizeof(why), "%s; %s", g_pbus->status, g_pbus->di.status);   // 1.8.0: both sources' reasons
+    L_.pushstring(L, why);
     if (r == PADHOOK_JOIN_RETRY) {
         L_.pushnumber(L, PADHOOK_RETRY_MS);
         return 3;
@@ -111,6 +115,29 @@ int __cdecl l_pad(lua_State* L) {
     return 10;
 }
 
+// 1.8.0: the DirectInput pad the game reads (PadHook rev 4), raw: seq, buttons (bit i: button i, 0..31), pov (hundredths
+// of a degree, -1 centred), x, y, z, rx, ry, rz, slider0, slider1 (-127..127, as the client ranges them), connected (the
+// client read it in the last second), holding, vendor, product (0 when not known). nil when not started; -1 while torn.
+int __cdecl l_pad_dinput(lua_State* L) {
+    if (!g_pbus || g_pslot < 0) { L_.pushnil(L); return 1; }
+    padhook_alive(g_pbus, g_pslot);
+    PadDiState s {};
+    if (!padhook_di_read(g_pbus, &s)) {
+        L_.pushnumber(L, -1);
+        return 1;
+    }
+    bool const on = s.seq != 0 && s.hr >= 0 && GetTickCount() - s.tick < PADHOOK_DI_FRESH_MS;
+    L_.pushnumber(L, s.seq);
+    L_.pushnumber(L, on ? s.buttons : 0);
+    L_.pushnumber(L, on && (s.pov & 0xFFFFul) != 0xFFFFul ? static_cast<double>(s.pov) : -1);
+    for (int a = 0; a < PADHOOK_JS_AXES; ++a) L_.pushnumber(L, on ? s.axes[a] : 0);
+    L_.pushboolean(L, on ? 1 : 0);
+    L_.pushboolean(L, padhook_holding(g_pbus, g_pslot) ? 1 : 0);
+    L_.pushnumber(L, s.vidpid & 0xFFFFul);
+    L_.pushnumber(L, s.vidpid >> 16);
+    return 15;
+}
+
 int __cdecl l_pad_capture(lua_State* L) {
     bool const on = L_.gettop(L) >= 1 && L_.toboolean(L, 1) != 0;
     if (!g_pbus || g_pslot < 0) { L_.pushboolean(L, 0); return 1; }
@@ -121,8 +148,10 @@ int __cdecl l_pad_capture(lua_State* L) {
 
 int __cdecl l_pad_chord(lua_State* L) {
     double const v = L_.gettop(L) >= 1 && L_.type(L, 1) == kTNumber ? L_.tonumber(L, 1) : 0;
+    double const d = L_.gettop(L) >= 2 && L_.type(L, 2) == kTNumber ? L_.tonumber(L, 2) : 0;   // 1.8.0: DirectInput buttons
     if (!g_pbus || g_pslot < 0) { L_.pushboolean(L, 0); return 1; }
     padhook_chord(g_pbus, g_pslot, v > 0 ? static_cast<unsigned long>(v) & 0x3FFFFul : 0);
+    padhook_di_chord(g_pbus, g_pslot, d > 0 && d < 4294967296.0 ? static_cast<unsigned long>(d) : 0);
     L_.pushboolean(L, 1);
     return 1;
 }
@@ -183,6 +212,28 @@ int __cdecl l_pad_status(lua_State* L) {
     char site[16];
     std::snprintf(site, sizeof(site), "%08lX", static_cast<unsigned long>(b->site));
     set_str(L, "site", site);
+    // 1.8.0: the DirectInput source (PadHook rev 4)
+    PadDiHook const& h = b->di;
+    set_str(L, "di_state", state_name(padhook_di_state(b)));
+    padhook_di_describe(b, line, sizeof(line));
+    set_str(L, "di_describe", line);
+    PadDiState d {};
+    if (padhook_di_read(b, &d)) {
+        char name[33];
+        std::memcpy(name, d.name, 32);
+        name[32] = 0;
+        set_str(L, "di_name", name);
+        set_num(L, "di_vendor", d.vidpid & 0xFFFFul);
+        set_num(L, "di_product", d.vidpid >> 16);
+        set_num(L, "di_reads", d.reads);
+        set_bool(L, "di_connected", d.seq != 0 && d.hr >= 0 && GetTickCount() - d.tick < PADHOOK_DI_FRESH_MS);
+    }
+    set_num(L, "di_calls", h.calls);
+    set_num(L, "di_chord", h.press.chord);
+    set_num(L, "di_masked", h.press.hid | h.press.wait);
+    set_num(L, "di_hidden", h.press.hidden);
+    set_num(L, "di_injected", h.press.injected);
+    set_num(L, "di_chords", h.press.chords);
     return 1;
 }
 
